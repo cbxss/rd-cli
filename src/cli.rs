@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "rd", version, about = "Real-Debrid from your command line")]
+#[command(name = "rd", version, about = "real-debrid cli")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -32,7 +32,7 @@ pub enum Commands {
     Hosts {
         #[arg(long)]
         status: bool,
-        #[arg(long)]
+        #[arg(long, help = "Print machine-readable JSON")]
         json: bool,
     },
     /// Show traffic / bandwidth usage
@@ -43,7 +43,7 @@ pub enum Commands {
         from: Option<String>,
         #[arg(long)]
         to: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Print machine-readable JSON")]
         json: bool,
     },
     /// Generate shell completions
@@ -58,7 +58,7 @@ pub enum AuthCommand {
     Logout,
     /// Show the currently authenticated account
     Whoami {
-        #[arg(long)]
+        #[arg(long, help = "Print machine-readable JSON")]
         json: bool,
     },
 }
@@ -85,7 +85,7 @@ pub struct UnrestrictArgs {
     /// Print the unrestricted links to stdout instead of downloading
     #[arg(short = 'l', long)]
     pub list: bool,
-    #[arg(long)]
+    #[arg(long, help = "Print machine-readable JSON")]
     pub json: bool,
     /// Number of concurrent connections for large, range-capable downloads
     #[arg(long, default_value_t = 8)]
@@ -128,7 +128,7 @@ pub enum TorrentsCommand {
     List {
         #[arg(long)]
         filter: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Print machine-readable JSON")]
         json: bool,
     },
     /// Show torrent details
@@ -143,7 +143,7 @@ pub enum TorrentsCommand {
 pub enum DownloadsCommand {
     /// List download history
     List {
-        #[arg(long)]
+        #[arg(long, help = "Print machine-readable JSON")]
         json: bool,
     },
     /// Delete a download history entry
