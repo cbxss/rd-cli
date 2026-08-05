@@ -13,7 +13,7 @@ This installs the latest GitHub Release to `~/.local/bin`.
 For a specific version:
 
 ```bash
-RD_INSTALL_VERSION=v0.1.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/cbxss/rd-cli/main/install.sh)"
+RD_INSTALL_VERSION=v0.1.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/cbxss/rd-cli/main/install.sh)"
 ```
 
 Build from source:
