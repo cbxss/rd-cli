@@ -1,14 +1,6 @@
 # rd
 
-Use [Real-Debrid](https://real-debrid.com) from your command line. A modern Rust
-reimplementation of [`realdebrid-CLI`](https://github.com/MrMitch/realdebrid-CLI),
-built against the current Real-Debrid REST API (`api.real-debrid.com/rest/1.0`)
-instead of screen-scraping the website.
-
-Built to move very large files (200GB+) efficiently: downloads stream straight
-to disk and never buffer a whole file in memory, and large range-capable
-downloads are split into concurrent segments for throughput. Interrupted
-downloads resume rather than restarting from zero.
+A [Real-Debrid](https://real-debrid.com) CLI.
 
 ## Install
 
