@@ -1,0 +1,959 @@
+//! The torrent workflow shared by `rd dl` and `rd torrents`: add (or reuse)
+//! a torrent, select files once Real-Debrid is ready, wait for it to finish,
+//! then unrestrict and download its links.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use futures_util::{StreamExt, stream};
+
+use crate::api::Client;
+use crate::api::error::RdError;
+use crate::api::models::{AddMagnetResponse, Torrent, TorrentInfo, UnrestrictedLink};
+use crate::download::{self, DownloadOpts};
+
+pub const TERMINAL_FAILURE_STATUSES: &[&str] = &["error", "virus", "dead", "magnet_error"];
+
+/// Stall timeout for commands that don't expose `--stall-timeout`.
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Number of consecutive polls a torrent may report `downloaded` without
+/// links before we give up (in case the links lag the status briefly).
+const EMPTY_LINKS_TOLERANCE: u32 = 3;
+
+/// How often torrent status is polled. `RD_POLL_MS` overrides it (used by the
+/// end-to-end tests to keep slow-torrent scenarios fast).
+fn poll_interval() -> Duration {
+    if cfg!(test) {
+        return Duration::from_millis(5);
+    }
+    std::env::var("RD_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(5))
+}
+
+/// Real-Debrid answers an unknown torrent ID with `unknown_ressource` (7), or
+/// `unknown_method` (3) when the ID doesn't match its routing pattern.
+pub fn is_not_found(err: &RdError) -> bool {
+    matches!(
+        err,
+        RdError::Api {
+            code: 3 | 7 | 404,
+            ..
+        }
+    )
+}
+
+pub async fn get_info(client: &Client, id: &str) -> Result<TorrentInfo> {
+    match client.get_json(&format!("/torrents/info/{id}")).await {
+        Ok(info) => Ok(info),
+        Err(err) if is_not_found(&err) => anyhow::bail!(
+            "torrent {id} not found on this account — it may have been deleted (see `rd torrents list`)"
+        ),
+        Err(err) => Err(err.into()),
+    }
+}
+
+// ---- adding ----
+
+/// Extracts the lowercase hex info-hash from a magnet's `xt=urn:btih:`
+/// parameter, accepting the 40-char hex and 32-char base32 forms.
+pub fn magnet_hash(magnet: &str) -> Option<String> {
+    let query = magnet.strip_prefix("magnet:?")?;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        if k != "xt" {
+            return None;
+        }
+        let v = v.to_ascii_lowercase().replace("%3a", ":");
+        let hash = v.strip_prefix("urn:btih:")?;
+        if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(hash.to_string())
+        } else if hash.len() == 32 {
+            base32_to_hex(hash)
+        } else {
+            None
+        }
+    })
+}
+
+/// RFC 4648 base32 (no padding) to lowercase hex.
+fn base32_to_hex(s: &str) -> Option<String> {
+    let mut bits = 0u64;
+    let mut nbits = 0u32;
+    let mut out = String::with_capacity(40);
+    for c in s.chars() {
+        let v = match c.to_ascii_lowercase() {
+            c @ 'a'..='z' => c as u64 - 'a' as u64,
+            c @ '2'..='7' => c as u64 - '2' as u64 + 26,
+            _ => return None,
+        };
+        bits = (bits << 5) | v;
+        nbits += 5;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push_str(&format!("{:02x}", (bits >> nbits) & 0xff));
+        }
+    }
+    (out.len() == 40).then_some(out)
+}
+
+/// Finds a torrent already on the account with this hash that hasn't failed
+/// and will deliver every file (not yet selected, or all files selected),
+/// preferring one that has finished downloading. A copy where only some files
+/// were picked is skipped, since `rd dl` promises the whole torrent.
+async fn find_existing(client: &Client, hash: &str) -> Result<Option<Torrent>> {
+    let torrents: Vec<Torrent> = client.get_all_pages("/torrents", &[]).await?;
+    let mut candidates: Vec<Torrent> = torrents
+        .into_iter()
+        .filter(|t| {
+            t.hash.eq_ignore_ascii_case(hash)
+                && !TERMINAL_FAILURE_STATUSES.contains(&t.status.as_str())
+        })
+        .collect();
+    candidates.sort_by_key(|t| t.status != "downloaded");
+    for t in candidates {
+        let info = get_info(client, &t.id).await?;
+        let unselected = matches!(
+            info.status.as_str(),
+            "magnet_conversion" | "waiting_files_selection"
+        );
+        if unselected || info.files.iter().all(|f| f.selected != 0) {
+            return Ok(Some(t));
+        }
+    }
+    Ok(None)
+}
+
+/// Attempts at `addMagnet` when the outcome of a request is unknown.
+const ADD_ATTEMPTS: u32 = 3;
+
+/// A failure after which we can't tell whether the server acted on the
+/// request: a 5xx, or a connection lost after the request was sent.
+fn outcome_unknown(err: &RdError) -> bool {
+    match err {
+        RdError::Http(e) => !e.is_connect(),
+        RdError::Api { status, .. } => *status >= 500,
+        _ => false,
+    }
+}
+
+async fn ids_with_hash(client: &Client, hash: &str) -> Result<Vec<String>> {
+    let torrents: Vec<Torrent> = client.get_all_pages("/torrents", &[]).await?;
+    Ok(torrents
+        .into_iter()
+        .filter(|t| t.hash.eq_ignore_ascii_case(hash))
+        .map(|t| t.id)
+        .collect())
+}
+
+/// Adds a magnet. `addMagnet` isn't idempotent, so it's never blindly
+/// retried: after an ambiguous failure we first look for a torrent with the
+/// magnet's hash that wasn't there before, and only re-send if there's none.
+async fn add_magnet(client: &Client, link: &str, host: Option<&str>) -> Result<String> {
+    let mut form: Vec<(&str, &str)> = vec![("magnet", link)];
+    if let Some(h) = host {
+        form.push(("host", h));
+    }
+    let hash = magnet_hash(link);
+    let before = match &hash {
+        Some(h) => ids_with_hash(client, h).await?,
+        None => vec![],
+    };
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let err = match client
+            .post_form_once::<AddMagnetResponse>("/torrents/addMagnet", &form)
+            .await
+        {
+            Ok(resp) => return Ok(resp.id),
+            Err(err) => err,
+        };
+        if attempt >= ADD_ATTEMPTS || !outcome_unknown(&err) {
+            return Err(err).context("failed to add magnet");
+        }
+        if let Some(h) = &hash {
+            let created = ids_with_hash(client, h)
+                .await?
+                .into_iter()
+                .find(|id| !before.contains(id));
+            if let Some(id) = created {
+                return Ok(id);
+            }
+        }
+        tokio::time::sleep(poll_interval()).await;
+    }
+}
+
+/// Adds a magnet link or `.torrent` file; returns the new torrent's ID.
+pub async fn add(client: &Client, link: &str, host: Option<&str>) -> Result<String> {
+    let resp: AddMagnetResponse = if link.starts_with("magnet:") {
+        return add_magnet(client, link, host).await;
+    } else {
+        let bytes = tokio::fs::read(link)
+            .await
+            .with_context(|| format!("failed to read torrent file {link}"))?;
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(h) = host {
+            query.push(("host", h));
+        }
+        client
+            .put_bytes("/torrents/addTorrent", &query, bytes)
+            .await
+            .context("failed to add torrent file")?
+    };
+    Ok(resp.id)
+}
+
+/// Like [`add`], but reuses a usable torrent with the same magnet hash.
+pub async fn add_or_reuse(
+    client: &Client,
+    link: &str,
+    host: Option<&str>,
+    quiet: bool,
+) -> Result<String> {
+    if let Some(hash) = magnet_hash(link) {
+        if let Some(existing) = find_existing(client, &hash).await? {
+            if !quiet {
+                download::status(&format!(
+                    "Reusing existing torrent: {} ({})",
+                    existing.id, existing.status
+                ));
+            }
+            return Ok(existing.id);
+        }
+    }
+    let id = add(client, link, host).await?;
+    if !quiet {
+        download::status(&format!("Added torrent: {id}"));
+    }
+    Ok(id)
+}
+
+// ---- waiting ----
+
+/// Tracks whether a torrent is still moving. Any change in status or progress
+/// resets the clock.
+struct StallGuard {
+    timeout: Option<Duration>,
+    last: Option<(String, u64)>,
+    since: Instant,
+}
+
+impl StallGuard {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            timeout,
+            last: None,
+            since: Instant::now(),
+        }
+    }
+
+    fn check(&mut self, id: &str, info: &TorrentInfo) -> Result<()> {
+        let state = (info.status.clone(), info.progress.to_bits());
+        if self.last.as_ref() != Some(&state) {
+            self.last = Some(state);
+            self.since = Instant::now();
+            return Ok(());
+        }
+        let Some(timeout) = self.timeout else {
+            return Ok(());
+        };
+        if self.since.elapsed() >= timeout {
+            let seeders = info
+                .seeders
+                .map(|s| format!(", {s} seeders"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "torrent {id} made no progress for {} (status '{}', {:.1}%{seeders}). \
+                 It is still on Real-Debrid: run `rd dl {id}` to keep waiting, or \
+                 `rd torrents delete {id}` to give up.",
+                human_duration(timeout),
+                info.status,
+                info.progress,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn human_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 && secs % 60 == 0 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{d:?}")
+    }
+}
+
+async fn select_files(client: &Client, id: &str, files: &str) -> Result<()> {
+    client
+        .post_form_no_content(&format!("/torrents/selectFiles/{id}"), &[("files", files)])
+        .await
+        .context("failed to select files")
+}
+
+/// Waits out `magnet_conversion` (file IDs don't exist yet), then selects
+/// `files` if Real-Debrid is waiting for a selection. Torrents already past
+/// that point are left alone. Returns the torrent's state afterwards and
+/// whether a selection was made.
+pub async fn select_when_ready(
+    client: &Client,
+    id: &str,
+    files: &str,
+    quiet: bool,
+    stall: Option<Duration>,
+) -> Result<(TorrentInfo, bool)> {
+    let mut announced = false;
+    let mut guard = StallGuard::new(stall);
+    loop {
+        let info = get_info(client, id).await?;
+        match info.status.as_str() {
+            "magnet_conversion" => {
+                guard.check(id, &info)?;
+                if !quiet && !announced {
+                    download::status("waiting for Real-Debrid to convert the magnet...");
+                    announced = true;
+                }
+                tokio::time::sleep(poll_interval()).await;
+            }
+            "waiting_files_selection" => {
+                select_files(client, id, files).await?;
+                return Ok((get_info(client, id).await?, true));
+            }
+            _ => return Ok((info, false)),
+        }
+    }
+}
+
+/// Drives a torrent to the `downloaded` state: selects files once Real-Debrid
+/// is waiting for a selection (only then — a torrent already past that point
+/// keeps its selection), then polls until links appear or a terminal failure
+/// state is reached. Cached torrents resolve on the first check.
+pub async fn wait_for_links(
+    client: &Client,
+    id: &str,
+    files: &str,
+    quiet: bool,
+    stall: Option<Duration>,
+) -> Result<TorrentInfo> {
+    let mut guard = StallGuard::new(stall);
+    let mut selected = false;
+    let mut empty_links = 0u32;
+    let mut last_line = String::new();
+    loop {
+        let info = get_info(client, id).await?;
+
+        match info.status.as_str() {
+            "downloaded" if !info.links.is_empty() => return Ok(info),
+            "downloaded" => {
+                empty_links += 1;
+                if empty_links >= EMPTY_LINKS_TOLERANCE {
+                    anyhow::bail!(
+                        "torrent {id} is downloaded but Real-Debrid returned no links (see `rd torrents info {id}`)"
+                    );
+                }
+            }
+            "waiting_files_selection" if !selected => {
+                select_files(client, id, files).await?;
+                selected = true;
+                continue;
+            }
+            s if TERMINAL_FAILURE_STATUSES.contains(&s) => anyhow::bail!(
+                "torrent {id} failed on Real-Debrid with status '{s}'. \
+                 Delete it with `rd torrents delete {id}` before adding it again."
+            ),
+            _ => guard.check(id, &info)?,
+        }
+
+        if !quiet {
+            let mut line = format!(
+                "waiting on torrent: {} ({:.0}%)",
+                info.status,
+                info.progress.floor()
+            );
+            if let Some(seeders) = info.seeders {
+                line.push_str(&format!(", {seeders} seeders"));
+            }
+            if line != last_line {
+                download::status(&line);
+                last_line = line;
+            }
+        }
+
+        tokio::time::sleep(poll_interval()).await;
+    }
+}
+
+// ---- downloading ----
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinkOpts {
+    pub quiet: bool,
+    /// Connections per file.
+    pub concurrency: usize,
+    /// Files downloaded at the same time.
+    pub jobs: usize,
+}
+
+/// Waits for the torrent, then downloads all of its links.
+pub async fn download(
+    client: &Client,
+    id: &str,
+    files: &str,
+    out_dir: &Path,
+    opts: LinkOpts,
+    stall: Option<Duration>,
+) -> Result<()> {
+    let info = wait_for_links(client, id, files, opts.quiet, stall).await?;
+    download_links(client, &info.links, out_dir, opts).await
+}
+
+/// Unrestricts and downloads `links` into `out_dir`, `opts.jobs` at a time.
+/// Every link is attempted; files that fail get one more try on their own
+/// (with a freshly unrestricted link), and remaining failures are reported.
+pub async fn download_links(
+    client: &Client,
+    links: &[String],
+    out_dir: &Path,
+    opts: LinkOpts,
+) -> Result<()> {
+    let mut names = Names::default();
+    let mut failed = run_pass(
+        client,
+        links.iter().collect(),
+        out_dir,
+        opts,
+        &mut names,
+        opts.jobs,
+    )
+    .await;
+
+    // A second, sequential pass: parallel downloads can hit limits a single
+    // one doesn't (Real-Debrid's active-download cap, per-host connection
+    // limits), and re-unrestricting replaces a link that expired.
+    if !failed.is_empty() {
+        if !opts.quiet {
+            download::status(&format!(
+                "retrying {} failed file(s) one at a time",
+                failed.len()
+            ));
+        }
+        let retry: Vec<&String> = failed.iter().map(|(link, _)| *link).collect();
+        failed = run_pass(client, retry, out_dir, opts, &mut names, 1).await;
+    }
+
+    for (_, err) in &failed {
+        eprintln!("error: {err:#}");
+    }
+    if !failed.is_empty() {
+        anyhow::bail!("{} of {} file(s) failed", failed.len(), links.len());
+    }
+    Ok(())
+}
+
+/// One pass over `batch`: unrestrict every link, name the files in link
+/// order (so duplicate names resolve the same way on every run, however the
+/// parallel requests finish), then download `jobs` at a time. Returns the
+/// links that failed.
+async fn run_pass<'a>(
+    client: &Client,
+    batch: Vec<&'a String>,
+    out_dir: &Path,
+    opts: LinkOpts,
+    names: &mut Names,
+    jobs: usize,
+) -> Vec<(&'a String, anyhow::Error)> {
+    let jobs = jobs.max(1);
+    let resolved: Vec<(&String, Result<UnrestrictedLink>)> = stream::iter(batch)
+        .map(|link| async move {
+            let res = client
+                .post_form("/unrestrict/link", &[("link", link.as_str())])
+                .await
+                .with_context(|| format!("failed to unrestrict {link}"));
+            (link, res)
+        })
+        .buffered(jobs)
+        .collect()
+        .await;
+
+    let mut failures = Vec::new();
+    let mut work = Vec::new();
+    for (link, res) in resolved {
+        match res {
+            Ok(ul) => {
+                let name = names.for_link(link, &download::safe_filename(&ul.filename));
+                work.push((link, ul, out_dir.join(name)));
+            }
+            Err(err) => failures.push((link, err)),
+        }
+    }
+
+    let results: Vec<(&String, Result<()>)> = stream::iter(work)
+        .map(|(link, ul, dest)| async move { (link, fetch_unrestricted(&ul, &dest, opts).await) })
+        .buffer_unordered(jobs)
+        .collect()
+        .await;
+    failures.extend(
+        results
+            .into_iter()
+            .filter_map(|(link, res)| res.err().map(|e| (link, e))),
+    );
+    failures
+}
+
+async fn fetch_unrestricted(ul: &UnrestrictedLink, dest: &Path, opts: LinkOpts) -> Result<()> {
+    if !opts.quiet {
+        download::status(&format!(
+            "downloading {} -> {}",
+            ul.filename,
+            dest.display()
+        ));
+    }
+    let dl_opts = DownloadOpts {
+        concurrency: cap_connections(opts.concurrency, ul.chunks),
+        quiet: opts.quiet,
+    };
+    download::fetch(&ul.download, dest, dl_opts)
+        .await
+        .with_context(|| format!("failed to download {}", ul.filename))
+}
+
+/// Output names for the links of one download. Files in different torrent
+/// folders can share a name ("Season 1/x.mkv", "Season 2/x.mkv") and
+/// Real-Debrid only gives the base name, so each link claims a unique name —
+/// and keeps it if it's retried, so a retry resumes the same file.
+#[derive(Default)]
+struct Names {
+    taken: HashSet<String>,
+    by_link: HashMap<String, String>,
+}
+
+impl Names {
+    fn for_link(&mut self, link: &str, name: &str) -> String {
+        if let Some(existing) = self.by_link.get(link) {
+            return existing.clone();
+        }
+        let unique = unique_name(&mut self.taken, name);
+        self.by_link.insert(link.to_string(), unique.clone());
+        unique
+    }
+}
+
+/// Real-Debrid reports how many parallel connections ("chunks") a link allows;
+/// opening more risks refused or throttled requests.
+pub fn cap_connections(requested: usize, allowed: i64) -> usize {
+    if allowed > 0 {
+        requested.min(allowed as usize).max(1)
+    } else {
+        requested.max(1)
+    }
+}
+
+/// `name`, or `name (2).ext`, `name (3).ext`, ... if already taken.
+fn unique_name(claimed: &mut HashSet<String>, name: &str) -> String {
+    if claimed.insert(name.to_string()) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    (2..)
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|candidate| claimed.insert(candidate.clone()))
+        .expect("unbounded")
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn info(status: &str, links: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "id": "ABC", "filename": "f", "hash": "h", "bytes": 1, "host": "rd",
+            "split": 2000, "progress": 0.0, "status": status, "added": "x",
+            "links": links,
+        })
+    }
+
+    async fn mount_info_sequence(server: &MockServer, seq: &[serde_json::Value]) {
+        for (i, body) in seq.iter().enumerate() {
+            let m = Mock::given(method("GET"))
+                .and(path("/torrents/info/ABC"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()));
+            if i + 1 < seq.len() {
+                m.up_to_n_times(1).mount(server).await;
+            } else {
+                m.mount(server).await;
+            }
+        }
+    }
+
+    #[test]
+    fn magnet_hash_parsing() {
+        let h = "0123456789ABCDEF0123456789abcdef01234567";
+        assert_eq!(
+            magnet_hash(&format!("magnet:?dn=x&xt=urn:btih:{h}&tr=y")).as_deref(),
+            Some(h.to_ascii_lowercase().as_str())
+        );
+        assert_eq!(magnet_hash("magnet:?xt=urn:btih:SHORTBASE32"), None);
+        assert_eq!(magnet_hash("https://example.com"), None);
+        // Base32 form, and a percent-encoded `urn:btih:`.
+        assert_eq!(
+            magnet_hash("magnet:?xt=urn:btih:AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH").as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            magnet_hash(&format!("magnet:?xt=urn%3Abtih%3A{h}")).as_deref(),
+            Some(h.to_ascii_lowercase().as_str())
+        );
+    }
+
+    #[test]
+    fn unique_names_and_connection_caps() {
+        let mut claimed = HashSet::new();
+        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x.mkv");
+        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x (2).mkv");
+        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x (3).mkv");
+        assert_eq!(unique_name(&mut claimed, "README"), "README");
+        assert_eq!(unique_name(&mut claimed, "README"), "README (2)");
+        assert_eq!(cap_connections(8, 4), 4);
+        assert_eq!(cap_connections(8, 0), 8);
+        assert_eq!(cap_connections(0, 16), 1);
+    }
+
+    fn listed(id: &str, hash: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "filename": "f", "hash": hash, "bytes": 1, "host": "rd",
+            "split": 2000, "progress": 0.0, "status": "magnet_conversion", "added": "x",
+        })
+    }
+
+    #[tokio::test]
+    async fn add_magnet_does_not_duplicate_after_a_5xx() {
+        let h = "0123456789abcdef0123456789abcdef01234567";
+        let server = MockServer::start().await;
+        // Before the add: an older copy. After the failed add: a new one too.
+        Mock::given(method("GET"))
+            .and(path("/torrents"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([listed("OLD", h)])),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/torrents"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([listed("NEW", h), listed("OLD", h),])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/addMagnet"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let id = add(&client, &format!("magnet:?xt=urn:btih:{h}"), None)
+            .await
+            .unwrap();
+        assert_eq!(id, "NEW");
+    }
+
+    #[tokio::test]
+    async fn add_magnet_resends_when_nothing_was_created() {
+        let h = "0123456789abcdef0123456789abcdef01234567";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/torrents"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/addMagnet"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/addMagnet"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "OK", "uri": "u"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let id = add(&client, &format!("magnet:?xt=urn:btih:{h}"), None)
+            .await
+            .unwrap();
+        assert_eq!(id, "OK");
+    }
+
+    #[tokio::test]
+    async fn already_downloaded_torrent_is_not_reselected() {
+        let server = MockServer::start().await;
+        mount_info_sequence(
+            &server,
+            &[info("downloaded", &["https://real-debrid.com/d/X"])],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/selectFiles/ABC"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(
+                    serde_json::json!({"error": "unknown_ressource", "error_code": 7}),
+                ),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let got = wait_for_links(&client, "ABC", "all", true, None)
+            .await
+            .unwrap();
+        assert_eq!(got.links.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn selects_only_once_conversion_finishes() {
+        let server = MockServer::start().await;
+        mount_info_sequence(
+            &server,
+            &[
+                info("magnet_conversion", &[]),
+                info("waiting_files_selection", &[]),
+                info("downloading", &[]),
+                info("downloaded", &["https://real-debrid.com/d/X"]),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/selectFiles/ABC"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let got = wait_for_links(&client, "ABC", "all", true, None)
+            .await
+            .unwrap();
+        assert_eq!(got.status, "downloaded");
+    }
+
+    #[tokio::test]
+    async fn downloaded_without_links_fails_instead_of_looping() {
+        let server = MockServer::start().await;
+        mount_info_sequence(&server, &[info("downloaded", &[])]).await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let err = wait_for_links(&client, "ABC", "all", true, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no links"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn error_status_and_missing_torrent_are_reported() {
+        let server = MockServer::start().await;
+        mount_info_sequence(&server, &[info("error", &[])]).await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let err = wait_for_links(&client, "ABC", "all", true, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rd torrents delete ABC"), "{err}");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/torrents/info/ABC"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(
+                    serde_json::json!({"error": "unknown_ressource", "error_code": 7}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let err = wait_for_links(&client, "ABC", "all", true, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn select_when_ready_skips_finished_torrents() {
+        let server = MockServer::start().await;
+        mount_info_sequence(
+            &server,
+            &[info("downloaded", &["https://real-debrid.com/d/X"])],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/selectFiles/ABC"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let (got, selected) = select_when_ready(&client, "ABC", "all", true, None)
+            .await
+            .unwrap();
+        assert!(!selected);
+        assert_eq!(got.links.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn select_when_ready_waits_out_magnet_conversion() {
+        let server = MockServer::start().await;
+        mount_info_sequence(
+            &server,
+            &[
+                info("magnet_conversion", &[]),
+                info("magnet_conversion", &[]),
+                info("waiting_files_selection", &[]),
+                info("queued", &[]),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/selectFiles/ABC"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let (got, selected) = select_when_ready(&client, "ABC", "all", true, None)
+            .await
+            .unwrap();
+        assert!(selected);
+        assert_eq!(got.status, "queued");
+    }
+
+    fn info_at(status: &str, progress: f64) -> serde_json::Value {
+        let mut v = info(status, &[]);
+        v["progress"] = serde_json::json!(progress);
+        v
+    }
+
+    #[tokio::test]
+    async fn stalled_torrent_times_out() {
+        let server = MockServer::start().await;
+        mount_info_sequence(&server, &[info_at("downloading", 0.0)]).await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let err = wait_for_links(&client, "ABC", "all", true, Some(Duration::from_millis(30)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("made no progress"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stall_clock_resets_on_progress() {
+        let server = MockServer::start().await;
+        let mut seq: Vec<serde_json::Value> =
+            (1..=10).map(|p| info_at("downloading", p as f64)).collect();
+        seq.push(info("downloaded", &["https://real-debrid.com/d/X"]));
+        mount_info_sequence(&server, &seq).await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        // Each poll is ~5ms apart; a 4ms timeout would trip on any repeated state.
+        let got = wait_for_links(&client, "ABC", "all", true, Some(Duration::from_millis(4)))
+            .await
+            .unwrap();
+        assert_eq!(got.status, "downloaded");
+    }
+
+    #[tokio::test]
+    async fn magnet_with_partial_selection_is_not_reused() {
+        let h = "0123456789abcdef0123456789abcdef01234567";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/torrents"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": "PARTIAL", "filename": "f", "hash": h, "bytes": 1, "host": "rd",
+                    "split": 2000, "progress": 100.0, "status": "downloaded", "added": "x",
+                }])),
+            )
+            .mount(&server)
+            .await;
+        let mut partial = info("downloaded", &["https://real-debrid.com/d/X"]);
+        partial["files"] = serde_json::json!([
+            {"id": 1, "path": "/a", "bytes": 1, "selected": 1},
+            {"id": 2, "path": "/b", "bytes": 1, "selected": 0},
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/torrents/info/PARTIAL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(partial))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/addMagnet"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "NEW", "uri": "u"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let id = add_or_reuse(&client, &format!("magnet:?xt=urn:btih:{h}"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(id, "NEW");
+    }
+
+    #[tokio::test]
+    async fn magnet_reuses_existing_torrent_with_same_hash() {
+        let h = "0123456789abcdef0123456789abcdef01234567";
+        let server = MockServer::start().await;
+        let torrent = |id: &str, status: &str| {
+            serde_json::json!({
+                "id": id, "filename": "f", "hash": h.to_ascii_uppercase(), "bytes": 1,
+                "host": "rd", "split": 2000, "progress": 100.0, "status": status, "added": "x",
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/torrents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                torrent("FAILED", "error"),
+                torrent("GOOD", "downloaded"),
+            ])))
+            .mount(&server)
+            .await;
+        let mut good = info("downloaded", &["https://real-debrid.com/d/X"]);
+        good["files"] = serde_json::json!([{"id": 1, "path": "/a", "bytes": 1, "selected": 1}]);
+        Mock::given(method("GET"))
+            .and(path("/torrents/info/GOOD"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(good))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/torrents/addMagnet"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let id = add_or_reuse(&client, &format!("magnet:?xt=urn:btih:{h}"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(id, "GOOD");
+    }
+}

@@ -1,18 +1,12 @@
-use std::env;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::api::Client;
-use crate::api::models::{AddMagnetResponse, Torrent, TorrentInfo, UnrestrictedLink};
-use crate::config::Config;
-use crate::download::{self, DownloadOpts};
+use crate::api::models::{Torrent, TorrentInfo};
 use crate::output;
+use crate::torrent::{self, LinkOpts};
 
 fn client() -> Result<Client> {
-    let config = Config::load()?;
-    let client = Client::new(config.api_token)?;
-    client.require_token()?;
-    Ok(client)
+    Client::from_config()
 }
 
 pub async fn add(
@@ -22,33 +16,11 @@ pub async fn add(
 ) -> Result<()> {
     let client = client()?;
 
-    let resp: AddMagnetResponse = if magnet_or_file.starts_with("magnet:") {
-        let mut form: Vec<(&str, &str)> = vec![("magnet", magnet_or_file.as_str())];
-        if let Some(h) = &host {
-            form.push(("host", h.as_str()));
-        }
-        client
-            .post_form("/torrents/addMagnet", &form)
-            .await
-            .context("failed to add magnet")?
-    } else {
-        let bytes = tokio::fs::read(&magnet_or_file)
-            .await
-            .with_context(|| format!("failed to read torrent file {magnet_or_file}"))?;
-        let mut query: Vec<(&str, &str)> = Vec::new();
-        if let Some(h) = &host {
-            query.push(("host", h.as_str()));
-        }
-        client
-            .put_bytes("/torrents/addTorrent", &query, bytes)
-            .await
-            .context("failed to add torrent file")?
-    };
-
-    println!("Added torrent: {}", resp.id);
+    let id = torrent::add(&client, &magnet_or_file, host.as_deref()).await?;
+    println!("Added torrent: {id}");
 
     if let Some(files) = select {
-        select_inner(&client, resp.id, files).await?;
+        select_inner(&client, id, files).await?;
     }
 
     Ok(())
@@ -61,7 +33,7 @@ pub async fn list(filter: Option<String>, json: bool) -> Result<()> {
     if let Some(f) = &filter {
         query.push(("filter", f.as_str()));
     }
-    let torrents: Vec<Torrent> = client.get_json_query("/torrents", &query).await?;
+    let torrents: Vec<Torrent> = client.get_all_pages("/torrents", &query).await?;
 
     if json {
         output::print_json(&torrents)?;
@@ -105,8 +77,8 @@ pub async fn info(id: String) -> Result<()> {
     if let Some(ended) = &info.ended {
         println!("Ended:    {ended}");
     }
-    if !info.links.is_empty() {
-        println!("Links:    {}", info.links.len());
+    for link in &info.links {
+        println!("Link:     {link}");
     }
 
     if !info.files.is_empty() {
@@ -139,40 +111,35 @@ pub async fn select(id: String, files: String) -> Result<()> {
 }
 
 async fn select_inner(client: &Client, id: String, files: String) -> Result<()> {
-    client
-        .post_form_no_content(
-            &format!("/torrents/selectFiles/{id}"),
-            &[("files", files.as_str())],
-        )
-        .await
-        .context("failed to select files")?;
-
-    let info: TorrentInfo = client.get_json(&format!("/torrents/info/{id}")).await?;
+    let (info, selected) = torrent::select_when_ready(
+        client,
+        &id,
+        &files,
+        false,
+        Some(torrent::DEFAULT_STALL_TIMEOUT),
+    )
+    .await?;
+    if !selected {
+        println!(
+            "Torrent {id} is '{}', not waiting for a file selection; keeping its current selection.",
+            info.status
+        );
+    }
 
     if info.links.is_empty() {
         println!(
-            "Files selected. Torrent status is '{}' — no download links available yet; check back with `rd torrents info {id}` or `rd torrents select {id} {files}` once it finishes.",
+            "Torrent status is '{}' — no download links available yet; run `rd dl {id}` to wait for it and download.",
             info.status
         );
         return Ok(());
     }
 
-    let dest_dir = env::current_dir().context("failed to determine current directory")?;
-
-    for link in &info.links {
-        let resolved: UnrestrictedLink = client
-            .post_form("/unrestrict/link", &[("link", link.as_str())])
-            .await
-            .with_context(|| format!("failed to unrestrict link {link}"))?;
-
-        let dest = dest_dir.join(&resolved.filename);
-        println!("Downloading {}...", resolved.filename);
-        download::fetch(&resolved.download, &dest, DownloadOpts::default())
-            .await
-            .with_context(|| format!("failed to download {}", resolved.filename))?;
-    }
-
-    Ok(())
+    let opts = LinkOpts {
+        quiet: false,
+        concurrency: 8,
+        jobs: 3,
+    };
+    torrent::download_links(client, &info.links, std::path::Path::new("."), opts).await
 }
 
 pub async fn delete(id: String) -> Result<()> {

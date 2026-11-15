@@ -14,13 +14,31 @@ fn project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from("", "", "rd").context("could not determine home directory")
 }
 
+/// `RD_CONFIG_DIR` overrides where `config.toml` lives.
 fn config_path() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("RD_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir).join("config.toml"));
+    }
     let dirs = project_dirs()?;
     Ok(dirs.config_dir().join("config.toml"))
 }
 
 impl Config {
+    /// Loads the saved config. A non-empty `RD_TOKEN` environment variable
+    /// takes precedence over the saved token.
     pub fn load() -> Result<Self> {
+        let mut config = Self::load_file()?;
+        if let Ok(token) = std::env::var("RD_TOKEN") {
+            if !token.is_empty() {
+                config.api_token = Some(token);
+            }
+        }
+        Ok(config)
+    }
+
+    /// Loads only what's saved on disk, ignoring `RD_TOKEN` (for login/logout,
+    /// which edit the saved file).
+    pub fn load_file() -> Result<Self> {
         let path = config_path()?;
         if !path.exists() {
             return Ok(Config::default());

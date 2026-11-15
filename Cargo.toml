@@ -26,8 +26,11 @@ indicatif = "0.17"
 comfy-table = "7"
 futures-util = "0.3"
 rpassword = "7"
+fs4 = "1"
 
 [dev-dependencies]
+axum = "0.8"
+tempfile = "3"
 wiremock = "0.6"
 
 [profile.release]

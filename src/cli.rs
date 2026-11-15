@@ -111,6 +111,42 @@ pub struct DlArgs {
     /// Number of concurrent connections for large, range-capable downloads
     #[arg(long, default_value_t = 8)]
     pub concurrency: usize,
+    /// Number of files to download at the same time (torrents with several files)
+    #[arg(short = 'j', long, default_value_t = 3)]
+    pub jobs: usize,
+    /// Give up on a torrent after this long without progress: e.g. 30m, 2h, 90s; a bare number is minutes; 0 waits forever
+    #[arg(long, value_name = "DURATION", default_value = "30m", value_parser = parse_duration)]
+    pub stall_timeout: std::time::Duration,
+}
+
+/// Parses `90s`, `30m`, `2h`, or a bare number of minutes.
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, 's')) => (&s[..i], 1),
+        Some((i, 'm')) => (&s[..i], 60),
+        Some((i, 'h')) => (&s[..i], 3600),
+        _ => (s, 60),
+    };
+    num.trim()
+        .parse::<u64>()
+        .map(|n| std::time::Duration::from_secs(n * mult))
+        .map_err(|_| format!("invalid duration '{s}' (use e.g. 90s, 30m, 2h)"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("30"), Ok(Duration::from_secs(1800)));
+        assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("0"), Ok(Duration::ZERO));
+        assert!(parse_duration("soon").is_err());
+    }
 }
 
 #[derive(Subcommand)]

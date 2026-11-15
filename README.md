@@ -42,6 +42,8 @@ Download almost anything with `rd dl`:
 rd dl 'magnet:?xt=urn:btih:...'
 rd dl ./movie.torrent
 rd dl https://host.com/file.zip
+rd dl <torrent-or-download-id>
+rd dl -j 1 'magnet:?xt=urn:btih:...'   # one file at a time (default: 3)
 rd dl -o ~/Downloads links.txt
 ```
 
@@ -80,9 +82,19 @@ Most listing commands accept `--json`.
 rd completions zsh > ~/.zfunc/_rd
 ```
 
+## Environment
+
+- `RD_TOKEN`: use this API token instead of the saved one
+- `RD_CONFIG_DIR`: directory holding `config.toml`
+- `RD_API_URL`: API base URL (the end-to-end tests point this at a fake server)
+- `RD_POLL_MS`: torrent status poll interval in milliseconds (default 5000)
+
 ## Development
 
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+`tests/e2e.rs` runs the real binary against a fake Real-Debrid
+(`tests/support/mod.rs`), so it needs no account or network access.
