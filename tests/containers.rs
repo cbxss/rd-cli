@@ -507,3 +507,41 @@ fn disk_filling_up_mid_download_fails_cleanly() {
     let got = exec_bytes(&rdbox, &["cat", &format!("/out/{}", left[0])]);
     assert!(got == expected.as_slice(), "{} is corrupt", left[0]);
 }
+
+/// HTTPS download throughput through Caddy. Not pass/fail; compare builds:
+/// `cargo test --release --features container-tests --test containers tls_throughput -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn tls_throughput() {
+    let size: usize = std::env::var("RD_BENCH_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let file = data(size * MIB, 9);
+    let files = [("bench.bin", file.clone())];
+    let (caddy, root_pem) = caddy_tls(&files);
+    let port = caddy.get_host_port_ipv4(8443.tcp()).unwrap();
+    let fake = Fake::start();
+    fake.on_magnet(torrent(&files));
+    fake.serve_files_from(&format!("https://localhost:{port}"));
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("root.pem");
+    std::fs::write(&ca, &root_pem).unwrap();
+    for run in 0..3 {
+        let out_dir = format!("out{run}");
+        let started = Instant::now();
+        let out = rd(
+            &fake,
+            dir.path(),
+            &[("RD_CA_CERT", ca.to_str().unwrap())],
+            &["dl", &magnet(), "-o", &out_dir, "-q"],
+        );
+        let secs = started.elapsed().as_secs_f64();
+        assert!(out.ok, "{}", out.stderr);
+        println!(
+            "TLSBENCH {size} MiB in {secs:.2}s = {:.0} MiB/s",
+            size as f64 / secs
+        );
+        std::fs::remove_dir_all(dir.path().join(&out_dir)).unwrap();
+    }
+}

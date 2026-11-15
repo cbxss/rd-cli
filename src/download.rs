@@ -370,6 +370,10 @@ async fn single_stream_once(
     if let Some(len) = expected.filter(|&len| len != written) {
         anyhow::bail!("short read: expected {len} bytes, got {written}");
     }
+    // Durable before the rename publishes it under the real name.
+    file.sync_data()
+        .await
+        .context("failed to flush download to disk")?;
     Ok(())
 }
 
@@ -514,7 +518,17 @@ async fn download_segment(
             download_range_once(client, url, &file, (from, end), bytes_done, pb).await;
         written += progress;
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // Make the chunk durable before the caller records it as done
+                // in the sidecar; otherwise a power cut could leave a sidecar
+                // vouching for data that never reached the disk.
+                let file = Arc::clone(&file);
+                tokio::task::spawn_blocking(move || file.sync_data())
+                    .await
+                    .context("blocking sync task panicked")?
+                    .context("failed to flush chunk to disk")?;
+                return Ok(());
+            }
             Err(e) if is_fatal(&e) => return Err(e),
             Err(e) => {
                 stalled_attempts = if progress > 0 {
