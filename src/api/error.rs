@@ -24,6 +24,9 @@ pub enum RdError {
 
     #[error("rate limited after retries")]
     RateLimited,
+
+    #[error("{0}")]
+    Config(String),
 }
 
 /// Extra guidance for errors a user can act on.

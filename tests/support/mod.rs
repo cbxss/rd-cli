@@ -161,6 +161,9 @@ struct Inner {
     /// `(start, end)` of every non-probe ranged file request.
     ranges: Vec<(u64, u64)>,
     unrestricts: u64,
+    /// When set, unrestricted links point here (`{base}/{file name}`)
+    /// instead of at the fake's own file server.
+    download_base: Option<String>,
 }
 
 #[derive(Clone)]
@@ -237,6 +240,12 @@ impl Fake {
             "generated": "2026-01-01T00:00:00.000Z",
         }));
         id
+    }
+
+    /// Serve file bodies from another server (e.g. an nginx container) that
+    /// has each file under its base name.
+    pub fn serve_files_from(&self, base: &str) {
+        self.lock().download_base = Some(base.trim_end_matches('/').to_string());
     }
 
     pub fn faults(&self, f: impl FnOnce(&mut Faults)) {
@@ -487,7 +496,10 @@ async fn unrestrict(State(f): State<Fake>, Form(form): Form<HashMap<String, Stri
     Json(json!({
         "id": format!("U{}", inner.unrestricts), "filename": filename,
         "filesize": data.len(), "link": link, "host": "fake", "chunks": 32,
-        "download": format!("{base}/files/{key}?u={}", inner.unrestricts),
+        "download": match &inner.download_base {
+            Some(ext) => format!("{ext}/{filename}"),
+            None => format!("{base}/files/{key}?u={}", inner.unrestricts),
+        },
         "streamable": 0,
     }))
     .into_response()

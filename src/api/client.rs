@@ -46,10 +46,8 @@ impl Client {
     }
 
     pub(crate) fn with_base_url(base_url: String, token: Option<String>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("rd/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(60))
+        let http = crate::http::builder()
+            .map_err(|e| RdError::Config(format!("{e:#}")))?
             .build()?;
         Ok(Self {
             http,

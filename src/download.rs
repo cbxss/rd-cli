@@ -41,15 +41,15 @@ const MAX_ATTEMPTS: u32 = 5;
 
 /// One HTTP client for every download in the process, so connections (and
 /// TLS sessions) to the same download server are reused across files.
-fn http() -> &'static Client {
+fn http() -> Result<&'static Client> {
     static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(60))
-            .build()
-            .expect("failed to build HTTP client")
-    })
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    let client = crate::http::builder()?
+        .build()
+        .context("failed to build HTTP client")?;
+    Ok(CLIENT.get_or_init(|| client))
 }
 
 /// All progress bars live here, so several files can download at once
@@ -241,7 +241,7 @@ async fn probe(client: &Client, url: &str) -> Result<ProbeResult> {
 /// Resumable: interrupted downloads leave a `<dest>.rdpart` sidecar that is
 /// picked back up on the next call with the same `dest`.
 pub async fn fetch(url: &str, dest: &Path, opts: DownloadOpts) -> Result<()> {
-    let client = http();
+    let client = http()?;
     let probe_result = probe(client, url).await?;
 
     // A file of the expected size with no `.rdpart` sidecar is a finished
@@ -487,6 +487,9 @@ async fn fetch_segmented(
     Ok(())
 }
 
+/// Downloads one chunk. A cut-off attempt keeps what it wrote: the retry
+/// asks only for the rest of the chunk. Gives up after `MAX_ATTEMPTS`
+/// consecutive attempts that made no progress.
 async fn download_segment(
     client: &Client,
     url: &str,
@@ -496,121 +499,112 @@ async fn download_segment(
     pb: &ProgressBar,
 ) -> Result<()> {
     let (start, end) = range;
+    let file = Arc::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dest)
+            .with_context(|| format!("failed to open {} for writing", dest.display()))?,
+    );
 
-    let mut attempt = 0u32;
+    let mut written = 0u64;
+    let mut stalled_attempts = 0u32;
     loop {
-        attempt += 1;
-        match download_segment_once(client, url, dest, range, bytes_done, pb).await {
+        let from = start + written;
+        let (progress, result) =
+            download_range_once(client, url, &file, (from, end), bytes_done, pb).await;
+        written += progress;
+        match result {
             Ok(()) => return Ok(()),
             Err(e) if is_fatal(&e) => return Err(e),
             Err(e) => {
-                if attempt >= MAX_ATTEMPTS {
+                stalled_attempts = if progress > 0 {
+                    1
+                } else {
+                    stalled_attempts + 1
+                };
+                if stalled_attempts >= MAX_ATTEMPTS {
                     return Err(e.context(format!(
-                        "failed to download byte range {start}-{end} after {attempt} attempts"
+                        "failed to download byte range {start}-{end} after {MAX_ATTEMPTS} attempts without progress"
                     )));
                 }
-                tokio::time::sleep(retry_delay(attempt)).await;
+                tokio::time::sleep(retry_delay(stalled_attempts)).await;
             }
         }
     }
 }
 
-async fn download_segment_once(
+/// Requests `range` once and writes it in place. Returns how many bytes were
+/// written (kept even if the attempt then fails) and the outcome.
+async fn download_range_once(
     client: &Client,
     url: &str,
-    dest: &Path,
+    file: &Arc<std::fs::File>,
     range: (u64, u64),
-    bytes_done: &Arc<AtomicU64>,
+    bytes_done: &AtomicU64,
     pb: &ProgressBar,
-) -> Result<()> {
+) -> (u64, Result<()>) {
     let (start, end) = range;
-
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(dest)
-        .with_context(|| format!("failed to open {} for writing", dest.display()))?;
-    let file = Arc::new(file);
-
-    let resp = client
-        .get(url)
-        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-        .send()
-        .await
-        .with_context(|| format!("request failed for range {start}-{end}"))?;
-    let resp = check_status(resp, &format!("range {start}-{end}"))?;
-
-    // Writing a non-ranged (200) body or a different range at `start` would
-    // silently corrupt the file, so insist on exactly the range we asked for.
-    if resp.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(Fatal(format!(
-            "server ignored the range request for {start}-{end} (HTTP {}); retry with --concurrency 1",
-            resp.status()
-        ))
-        .into());
-    }
-    let served = resp
-        .headers()
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_range);
-    if served != Some((start, end)) {
-        return Err(Fatal(format!(
-            "server returned the wrong range for {start}-{end} ({served:?})"
-        ))
-        .into());
-    }
-
-    let mut stream = resp.bytes_stream();
-    let mut offset = start;
-    // Track bytes written in this attempt so we can roll back the shared
-    // counter/progress bar if this attempt fails partway and gets retried.
-    let mut written_this_attempt: u64 = 0;
+    let expected = end - start + 1;
+    let mut written = 0u64;
 
     let result: Result<()> = async {
+        let resp = client
+            .get(url)
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .await
+            .with_context(|| format!("request failed for range {start}-{end}"))?;
+        let resp = check_status(resp, &format!("range {start}-{end}"))?;
+
+        // Writing a non-ranged (200) body or a different range at `start`
+        // would silently corrupt the file, so insist on exactly this range.
+        if resp.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(Fatal(format!(
+                "server ignored the range request for {start}-{end} (HTTP {}); retry with --concurrency 1",
+                resp.status()
+            ))
+            .into());
+        }
+        let served = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range);
+        if served != Some((start, end)) {
+            return Err(Fatal(format!(
+                "server returned the wrong range for {start}-{end} ({served:?})"
+            ))
+            .into());
+        }
+
+        let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| {
                 format!("error while streaming response body for range {start}-{end}")
             })?;
-            let chunk_len = chunk.len() as u64;
-            if written_this_attempt + chunk_len > end - start + 1 {
+            let len = chunk.len() as u64;
+            if written + len > expected {
                 anyhow::bail!("server sent more than the requested range {start}-{end}");
             }
-            let write_offset = offset;
-            let file = Arc::clone(&file);
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                write_all_at(&file, &chunk, write_offset).context("positioned write failed")?;
-                Ok(())
-            })
-            .await
-            .context("blocking write task panicked")??;
-
-            offset += chunk_len;
-            written_this_attempt += chunk_len;
-            bytes_done.fetch_add(chunk_len, Ordering::Relaxed);
-            pb.set_position(bytes_done.load(Ordering::Relaxed));
+            let offset = start + written;
+            let file = Arc::clone(file);
+            tokio::task::spawn_blocking(move || write_all_at(&file, &chunk, offset))
+                .await
+                .context("blocking write task panicked")?
+                .context("positioned write failed")?;
+            written += len;
+            pb.set_position(bytes_done.fetch_add(len, Ordering::Relaxed) + len);
+        }
+        if written != expected {
+            anyhow::bail!(
+                "short read for range {start}-{end}: expected {expected} bytes, got {written}"
+            );
         }
         Ok(())
     }
     .await;
 
-    if let Err(e) = result {
-        // Roll back progress attributed to this failed attempt so a retry
-        // doesn't double count / overshoot the total.
-        bytes_done.fetch_sub(written_this_attempt, Ordering::Relaxed);
-        pb.set_position(bytes_done.load(Ordering::Relaxed));
-        return Err(e);
-    }
-
-    let expected = end - start + 1;
-    if written_this_attempt != expected {
-        bytes_done.fetch_sub(written_this_attempt, Ordering::Relaxed);
-        pb.set_position(bytes_done.load(Ordering::Relaxed));
-        anyhow::bail!(
-            "short read for range {start}-{end}: expected {expected} bytes, got {written_this_attempt}"
-        );
-    }
-
-    Ok(())
+    (written, result)
 }
 
 /// Parses `Content-Range: bytes S-E/TOTAL` into `(S, E)`.

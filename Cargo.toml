@@ -28,6 +28,16 @@ futures-util = "0.3"
 rpassword = "7"
 fs4 = "1"
 
+# Only for the Docker-based tests (`cargo test --features container-tests --test containers`).
+testcontainers = { version = "0.28", features = ["blocking"], optional = true }
+
+[features]
+container-tests = ["dep:testcontainers"]
+
+[[test]]
+name = "containers"
+required-features = ["container-tests"]
+
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
