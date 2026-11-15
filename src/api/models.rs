@@ -28,11 +28,16 @@ pub struct ApiErrorBody {
 pub struct UnrestrictedLink {
     pub id: String,
     pub filename: String,
+    #[serde(default)]
     pub filesize: i64,
+    #[serde(default)]
     pub link: String,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub chunks: i64,
     pub download: String,
+    #[serde(default)]
     pub streamable: i64,
     #[serde(default)]
     pub alternative: Vec<AlternativeLink>,
@@ -52,13 +57,19 @@ pub struct AlternativeLink {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Torrent {
     pub id: String,
+    #[serde(default)]
     pub filename: String,
     pub hash: String,
+    #[serde(default)]
     pub bytes: i64,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub split: i64,
+    #[serde(default)]
     pub progress: f64,
     pub status: String,
+    #[serde(default)]
     pub added: String,
     #[serde(default)]
     pub links: Vec<String>,
@@ -73,17 +84,23 @@ pub struct Torrent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentInfo {
     pub id: String,
+    #[serde(default)]
     pub filename: String,
     #[serde(default)]
     pub original_filename: Option<String>,
     pub hash: String,
+    #[serde(default)]
     pub bytes: i64,
     #[serde(default)]
     pub original_bytes: Option<i64>,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub split: i64,
+    #[serde(default)]
     pub progress: f64,
     pub status: String,
+    #[serde(default)]
     pub added: String,
     #[serde(default)]
     pub files: Vec<TorrentFile>,
@@ -101,7 +118,9 @@ pub struct TorrentInfo {
 pub struct TorrentFile {
     pub id: i64,
     pub path: String,
+    #[serde(default)]
     pub bytes: i64,
+    #[serde(default)]
     pub selected: i64,
 }
 
@@ -173,11 +192,16 @@ pub struct DownloadEntry {
     pub filename: String,
     #[serde(default, rename = "mimeType")]
     pub mime_type: Option<String>,
+    #[serde(default)]
     pub filesize: i64,
+    #[serde(default)]
     pub link: String,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub chunks: i64,
     pub download: String,
+    #[serde(default)]
     pub generated: String,
     #[serde(default)]
     pub streamable: Option<i64>,

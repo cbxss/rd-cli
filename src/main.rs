@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod download;
 mod output;
+mod torrent;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};

@@ -6,15 +6,12 @@ use anyhow::{Context, Result};
 use crate::api::Client;
 use crate::api::models::UnrestrictedLink;
 use crate::cli::UnrestrictArgs;
-use crate::config::Config;
 use crate::download::{self, DownloadOpts};
 use crate::output;
 
 pub async fn run(args: UnrestrictArgs) -> Result<()> {
-    let config = Config::load()?;
-    let client = Client::new(config.api_token)?;
-    // Fail fast, before touching the network, if we have no token.
-    client.require_token()?;
+    // Fails fast, before touching the network, if there is no token.
+    let client = Client::from_config()?;
 
     let links = collect_links(&args.link)?;
     if links.is_empty() {
@@ -27,7 +24,7 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
     for link in &links {
         match unrestrict_one(&client, link, args.password.as_deref()).await {
             Ok(ul) => {
-                if !args.quiet && !args.list {
+                if !args.quiet && !args.list && !args.json {
                     println!("unrestricted: {link} -> {}", ul.filename);
                 }
                 successes.push(ul);
@@ -87,21 +84,25 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
     let single = successes.len() == 1;
 
     for ul in &successes {
-        let filename = if single {
-            args.output_file
-                .clone()
-                .unwrap_or_else(|| ul.filename.clone())
-        } else {
-            ul.filename.clone()
+        // -O is the user's own choice and may include a path; the filename
+        // Real-Debrid returns is not, so it's reduced to a bare file name.
+        let filename = match (&args.output_file, single) {
+            (Some(name), true) => name.clone(),
+            _ => download::safe_filename(&ul.filename),
         };
         let dest = out_dir.join(&filename);
 
-        if !args.quiet {
-            println!("downloading {} -> {}", ul.filename, dest.display());
+        // With --json, stdout carries only the JSON document.
+        if !args.quiet && !args.json {
+            download::status(&format!(
+                "downloading {} -> {}",
+                ul.filename,
+                dest.display()
+            ));
         }
 
         let opts = DownloadOpts {
-            concurrency: args.concurrency,
+            concurrency: crate::torrent::cap_connections(args.concurrency, ul.chunks),
             quiet: args.quiet,
         };
         if let Err(err) = download::fetch(&ul.download, &dest, opts).await {

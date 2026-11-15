@@ -2,15 +2,12 @@ use anyhow::Result;
 
 use crate::api::Client;
 use crate::api::models::DownloadEntry;
-use crate::config::Config;
 use crate::output::{self, human_bytes};
 
 pub async fn list(json: bool) -> Result<()> {
-    let config = Config::load()?;
-    let client = Client::new(config.api_token)?;
-    client.require_token()?;
+    let client = Client::from_config()?;
 
-    let downloads: Vec<DownloadEntry> = client.get_json("/downloads").await?;
+    let downloads: Vec<DownloadEntry> = client.get_all_pages("/downloads", &[]).await?;
 
     if json {
         output::print_json(&downloads)?;
@@ -35,9 +32,7 @@ pub async fn list(json: bool) -> Result<()> {
 }
 
 pub async fn delete(id: String) -> Result<()> {
-    let config = Config::load()?;
-    let client = Client::new(config.api_token)?;
-    client.require_token()?;
+    let client = Client::from_config()?;
 
     client.delete(&format!("/downloads/delete/{id}")).await?;
     println!("Deleted download {id}");

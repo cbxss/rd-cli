@@ -19,7 +19,7 @@ pub async fn login() -> Result<()> {
         .await
         .context("token validation failed — check the token and try again")?;
 
-    let mut config = Config::load()?;
+    let mut config = Config::load_file()?;
     config.api_token = Some(token);
     config.save()?;
 
@@ -28,7 +28,7 @@ pub async fn login() -> Result<()> {
 }
 
 pub fn logout() -> Result<()> {
-    let mut config = Config::load()?;
+    let mut config = Config::load_file()?;
     if config.api_token.is_none() {
         println!("Not logged in.");
         return Ok(());
@@ -39,9 +39,7 @@ pub fn logout() -> Result<()> {
 }
 
 pub async fn whoami(json: bool) -> Result<()> {
-    let config = Config::load()?;
-    let client = Client::new(config.api_token)?;
-    client.require_token()?;
+    let client = Client::from_config()?;
     let user: User = client.get_json("/user").await?;
 
     if json {

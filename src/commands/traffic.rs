@@ -2,7 +2,6 @@ use anyhow::Result;
 
 use crate::api::Client;
 use crate::api::models::{TrafficDetailsResponse, TrafficResponse};
-use crate::config::Config;
 use crate::output::{self, human_bytes};
 
 pub async fn show(
@@ -11,9 +10,7 @@ pub async fn show(
     to: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let config = Config::load()?;
-    let client = Client::new(config.api_token)?;
-    client.require_token()?;
+    let client = Client::from_config()?;
 
     if details {
         let mut query: Vec<(&str, &str)> = Vec::new();
