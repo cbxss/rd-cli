@@ -394,14 +394,29 @@ fn connections_cut_mid_chunk_resume_where_they_stopped() {
     assert_file(&dir.path().join("out/cut.bin"), &big);
 }
 
+#[derive(serde::Deserialize)]
+struct Sidecar {
+    completed_ranges: Vec<(u64, u64)>,
+}
+
+fn completed_bytes(sidecar: &Path) -> u64 {
+    std::fs::read(sidecar)
+        .ok()
+        .and_then(|d| serde_json::from_slice::<Sidecar>(&d).ok())
+        .map_or(0, |s| {
+            s.completed_ranges.iter().map(|(a, b)| b - a + 1).sum()
+        })
+}
+
 #[test]
 fn stalled_server_times_out_then_resumes() {
-    let big = data(300 * MIB, 4);
+    // 128 MiB = two 64 MiB chunks, one connection, ~10 MiB/s: the first
+    // chunk finishes after ~6 s, then the server goes silent mid-chunk two.
+    let big = data(128 * MIB, 4);
     let files = [("stall.bin", big.clone())];
     let net = unique("net");
     let web = nginx(&files, Some(&net));
     let toxi = Toxi::start(&net, &format!("{}:80", web.name));
-    // ~10 MB/s so the download is still running when the stall starts.
     toxi.add_toxic(
         r#"{"name":"slow","type":"bandwidth","stream":"downstream","attributes":{"rate":10240}}"#,
     );
@@ -409,42 +424,59 @@ fn stalled_server_times_out_then_resumes() {
     fake.on_magnet(torrent(&files));
     fake.serve_files_from(&toxi.url());
     let dir = tempfile::tempdir().unwrap();
+    let sidecar = dir.path().join("out/stall.bin.rdpart");
+    let args = [
+        "dl",
+        &magnet(),
+        "-o",
+        "out",
+        "-q",
+        "-j",
+        "1",
+        "--concurrency",
+        "1",
+    ];
 
-    let toxi_for_stall = &toxi;
     let started = Instant::now();
     let out = std::thread::scope(|s| {
-        s.spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
+        s.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while completed_bytes(&sidecar) == 0 {
+                assert!(Instant::now() < deadline, "first chunk never finished");
+                std::thread::sleep(Duration::from_millis(50));
+            }
             // Stop sending data without closing anything.
-            toxi_for_stall.add_toxic(
+            toxi.add_toxic(
                 r#"{"name":"stall","type":"timeout","stream":"downstream","attributes":{"timeout":0}}"#,
             );
         });
-        rd(
-            &fake,
-            dir.path(),
-            &[("RD_READ_TIMEOUT_SECS", "2")],
-            &["dl", &magnet(), "-o", "out", "-q"],
-        )
+        rd(&fake, dir.path(), &[("RD_READ_TIMEOUT_SECS", "2")], &args)
     });
     assert!(!out.ok, "a stalled download should fail, not hang");
     assert!(
-        started.elapsed() < Duration::from_secs(90),
+        started.elapsed() < Duration::from_secs(120),
         "took {:?}",
         started.elapsed()
     );
-    assert!(!dir.path().join("out/stall.bin.rdtmp").exists());
-
-    toxi.remove_toxic("stall");
-    toxi.remove_toxic("slow");
-    let out = rd(
-        &fake,
-        dir.path(),
-        &[],
-        &["dl", &magnet(), "-o", "out", "-q"],
+    let kept = completed_bytes(&sidecar);
+    assert_eq!(
+        kept,
+        64 * MIB as u64,
+        "the finished chunk should be recorded for resume"
     );
+
+    // Same bandwidth, no stall: only the second chunk is left, ~6 s instead
+    // of ~13 s for the whole file.
+    toxi.remove_toxic("stall");
+    let started = Instant::now();
+    let out = rd(&fake, dir.path(), &[], &args);
+    let took = started.elapsed();
     assert!(out.ok, "{}", out.stderr);
     assert_file(&dir.path().join("out/stall.bin"), &big);
+    assert!(
+        took < Duration::from_secs(10),
+        "resume took {took:?}: was it a full re-download?"
+    );
 }
 
 #[test]

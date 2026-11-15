@@ -1671,6 +1671,7 @@ dependencies = [
  "fs4",
  "futures-util",
  "indicatif",
+ "libc",
  "reqwest",
  "rpassword",
  "serde",

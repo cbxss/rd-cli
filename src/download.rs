@@ -121,14 +121,35 @@ fn check_space(needed: u64, free: u64, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reduces a server-supplied file name to a single path component so it can't
-/// escape the output directory (`../x`, `/etc/x`, `a\\b`).
+/// Reduces a server-supplied file name to one portable path component, so it
+/// can't escape the output directory or misbehave on any OS: path separators
+/// and characters Windows forbids (`<>:"|?*`, control characters) become `_`
+/// (`C:x` would otherwise be a drive-relative path, `a:b` an NTFS stream),
+/// trailing dots and spaces go, and reserved device names (`CON`, `NUL.txt`,
+/// ...) get a `_` prefix.
 pub fn safe_filename(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
-    if base.is_empty() || base == "." || base == ".." {
-        "download".to_string()
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return "download".to_string();
+    }
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("_{cleaned}")
     } else {
-        base.to_string()
+        cleaned
     }
 }
 
@@ -185,9 +206,19 @@ impl Sidecar {
         let data = serde_json::to_vec(self)?;
         // Write-then-rename so an interrupt can't leave a half-written sidecar
         // (which would be ignored, and the partial download truncated).
+        // The temp file is synced first so that after a power cut the sidecar
+        // is either the old or the new version, never empty.
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-        std::fs::write(&tmp, data)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &data)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        }
         Ok(())
     }
 
@@ -235,41 +266,102 @@ async fn probe(client: &Client, url: &str) -> Result<ProbeResult> {
     })
 }
 
-/// Downloads `url` to `dest`, streaming straight to disk (never buffering the
-/// whole file in memory). Uses multi-segment parallel range requests for large,
-/// range-capable downloads and falls back to a single stream otherwise.
-/// Resumable: interrupted downloads leave a `<dest>.rdpart` sidecar that is
-/// picked back up on the next call with the same `dest`.
-pub async fn fetch(url: &str, dest: &Path, opts: DownloadOpts) -> Result<()> {
-    let client = http()?;
-    let probe_result = probe(client, url).await?;
-
-    // A file of the expected size with no `.rdpart` sidecar is a finished
-    // earlier download; don't fetch it again.
-    if let Some(total) = probe_result.total_size {
-        let finished = !Sidecar::path_for(dest).exists()
-            && std::fs::metadata(dest).is_ok_and(|m| m.is_file() && m.len() == total);
-        if finished {
-            if !opts.quiet {
-                status(&format!("already downloaded: {}", dest.display()));
-            }
-            return Ok(());
+/// [`probe`] with retries for transient failures.
+async fn probe_with_retry(client: &Client, url: &str) -> Result<ProbeResult> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match probe(client, url).await {
+            Ok(p) => return Ok(p),
+            Err(e) if is_fatal(&e) || attempt >= MAX_ATTEMPTS => return Err(e),
+            Err(_) => tokio::time::sleep(retry_delay(attempt)).await,
         }
     }
+}
 
-    let use_segmented = probe_result.supports_ranges
-        && probe_result
-            .total_size
-            .map(|sz| sz > SEGMENT_THRESHOLD)
-            .unwrap_or(false)
-        && opts.concurrency > 1;
+enum Destination {
+    /// A finished earlier download of this file.
+    Finished(PathBuf),
+    /// Where to write (possibly resuming a partial download there).
+    Write(PathBuf),
+}
 
-    if use_segmented {
-        let total_size = probe_result.total_size.expect("checked above");
-        fetch_segmented(client, url, dest, total_size, opts).await
-    } else {
-        fetch_single_stream(client, url, dest, probe_result.total_size, opts).await
+/// `dest`, then `name (2).ext`, `name (3).ext`, ...
+fn numbered(dest: &Path, n: u32) -> PathBuf {
+    if n == 1 {
+        return dest.to_path_buf();
     }
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let new = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    };
+    dest.with_file_name(new)
+}
+
+/// Decides where a download of `total` bytes goes. A path with a `.rdpart`
+/// sidecar is a partial download of ours to resume; a file of exactly
+/// `total` bytes without one is a finished earlier download. Any other
+/// existing file belongs to something else and is never overwritten: the
+/// download moves to the next free `name (n).ext`.
+fn pick_destination(dest: &Path, total: Option<u64>) -> Result<Destination> {
+    for n in 1..=1000 {
+        let candidate = numbered(dest, n);
+        if Sidecar::path_for(&candidate).exists() {
+            return Ok(Destination::Write(candidate));
+        }
+        match std::fs::metadata(&candidate) {
+            Err(_) => return Ok(Destination::Write(candidate)),
+            Ok(m) if m.is_file() && Some(m.len()) == total => {
+                return Ok(Destination::Finished(candidate));
+            }
+            Ok(_) => continue,
+        }
+    }
+    anyhow::bail!("no free file name for {}", dest.display())
+}
+
+/// Downloads `url` to `dest` (or a numbered variant if a different file
+/// already has that name) and returns the path written. Streams straight to
+/// disk; large range-capable downloads use parallel chunked requests and are
+/// resumable through a `<dest>.rdpart` sidecar, everything else streams to
+/// `<dest>.rdtmp` and is renamed when complete.
+pub async fn fetch(url: &str, dest: &Path, opts: DownloadOpts) -> Result<PathBuf> {
+    let client = http()?;
+    let probe_result = probe_with_retry(client, url).await?;
+
+    let dest = match pick_destination(dest, probe_result.total_size)? {
+        Destination::Finished(path) => {
+            if !opts.quiet {
+                status(&format!("already downloaded: {}", path.display()));
+            }
+            return Ok(path);
+        }
+        Destination::Write(path) => {
+            if path != dest && !opts.quiet {
+                status(&format!(
+                    "{} already exists with different content; saving as {}",
+                    dest.display(),
+                    path.display()
+                ));
+            }
+            path
+        }
+    };
+
+    // Chunked whenever the server supports ranges, even with one connection:
+    // that is the resumable path.
+    let segmented_size = probe_result
+        .total_size
+        .filter(|&size| probe_result.supports_ranges && size > SEGMENT_THRESHOLD);
+    match segmented_size {
+        Some(total) => fetch_segmented(client, url, &dest, total, opts).await?,
+        None => fetch_single_stream(client, url, &dest, probe_result.total_size, opts).await?,
+    }
+    Ok(dest)
 }
 
 fn make_progress_bar(total: Option<u64>, quiet: bool) -> ProgressBar {
@@ -323,7 +415,7 @@ async fn fetch_single_stream(
     let result = loop {
         attempt += 1;
         pb.set_position(0);
-        match single_stream_once(client, url, &tmp, &pb).await {
+        match single_stream_once(client, url, &tmp, total_size, &pb).await {
             Ok(()) => break Ok(()),
             Err(e) if is_fatal(&e) || attempt >= MAX_ATTEMPTS => break Err(e),
             Err(_) => tokio::time::sleep(retry_delay(attempt)).await,
@@ -336,18 +428,25 @@ async fn fetch_single_stream(
         return Err(e);
     }
     std::fs::rename(&tmp, dest)
-        .with_context(|| format!("failed to move download into place at {}", dest.display()))
+        .with_context(|| format!("failed to move download into place at {}", dest.display()))?;
+    // A sidecar left by an earlier chunked attempt would make the finished
+    // file look partial forever.
+    Sidecar::delete(dest);
+    Ok(())
 }
 
 async fn single_stream_once(
     client: &Client,
     url: &str,
     tmp: &Path,
+    probed_size: Option<u64>,
     pb: &ProgressBar,
 ) -> Result<()> {
     let resp = client.get(url).send().await.context("request failed")?;
     let resp = check_status(resp, "download failed")?;
-    let expected = resp.content_length();
+    // Without a Content-Length (chunked or close-delimited bodies) a dropped
+    // connection looks like a normal end, so fall back to the probed size.
+    let expected = resp.content_length().or(probed_size);
     if let Some(len) = expected {
         pb.set_length(len);
     }
@@ -441,6 +540,9 @@ async fn fetch_segmented(
 
     let mut tasks = tokio::task::JoinSet::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(opts.concurrency.max(1)));
+    // Set by the first chunk that fails, so queued chunks don't start new
+    // requests in the moment before the remaining tasks are aborted.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     for range in pending_ranges {
         let client = client.clone();
@@ -450,10 +552,17 @@ async fn fetch_segmented(
         let pb = pb.clone();
         let sem = Arc::clone(&sem);
         let sidecar = Arc::clone(&sidecar);
+        let stop = Arc::clone(&stop);
 
         tasks.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore closed");
-            download_segment(&client, &url, &dest, range, &bytes_done, &pb).await?;
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Err(e) = download_segment(&client, &url, &dest, range, &bytes_done, &pb).await {
+                stop.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
             {
                 let mut sc = sidecar.lock().await;
                 sc.mark_done(range);
@@ -513,10 +622,25 @@ async fn download_segment(
     let mut written = 0u64;
     let mut stalled_attempts = 0u32;
     loop {
-        let from = start + written;
-        let (progress, result) =
-            download_range_once(client, url, &file, (from, end), bytes_done, pb).await;
-        written += progress;
+        // An attempt can deliver every byte and still fail (the connection
+        // drops before the body is formally complete); then there's nothing
+        // left to request.
+        let result = if start + written > end {
+            Ok(())
+        } else {
+            let (progress, result) =
+                download_range_once(client, url, &file, (start + written, end), bytes_done, pb)
+                    .await;
+            written += progress;
+            if result.is_err() {
+                stalled_attempts = if progress > 0 {
+                    1
+                } else {
+                    stalled_attempts + 1
+                };
+            }
+            result
+        };
         match result {
             Ok(()) => {
                 // Make the chunk durable before the caller records it as done
@@ -530,12 +654,8 @@ async fn download_segment(
                 return Ok(());
             }
             Err(e) if is_fatal(&e) => return Err(e),
+            Err(_) if start + written > end => continue,
             Err(e) => {
-                stalled_attempts = if progress > 0 {
-                    1
-                } else {
-                    stalled_attempts + 1
-                };
                 if stalled_attempts >= MAX_ATTEMPTS {
                     return Err(e.context(format!(
                         "failed to download byte range {start}-{end} after {MAX_ATTEMPTS} attempts without progress"
@@ -775,6 +895,136 @@ mod tests {
     fn content_range_parsing() {
         assert_eq!(parse_content_range("bytes 0-99/1000"), Some((0, 99)));
         assert_eq!(parse_content_range("bytes */1000"), None);
+    }
+
+    /// A one-shot raw HTTP server: answers each connection with
+    /// `respond(request_head)` and then closes it.
+    async fn raw_server(respond: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let respond = Arc::clone(&respond);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = sock.write_all(&respond(&head)).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/f.bin")
+    }
+
+    fn requested_range(head: &str) -> Option<(usize, usize)> {
+        let line = head
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("range:"))?;
+        let (s, e) = line.split_once('=')?.1.trim().split_once('-')?;
+        Some((s.parse().ok()?, e.parse().ok()?))
+    }
+
+    #[tokio::test]
+    async fn chunk_fully_received_before_a_dropped_connection_is_kept() {
+        // Chunked range responses whose connection closes after the last data
+        // byte but before the end-of-body marker.
+        let total = (SEGMENT_THRESHOLD + 4096) as usize;
+        let data: Arc<Vec<u8>> = Arc::new((0..total).map(|i| (i % 253) as u8).collect());
+        let d = Arc::clone(&data);
+        let url = raw_server(move |head| {
+            let (s, e) = requested_range(head).unwrap();
+            let mut out = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{e}/{}\r\n\
+                 Transfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                d.len(),
+                e - s + 1
+            )
+            .into_bytes();
+            out.extend_from_slice(&d[s..=e]);
+            out.extend_from_slice(b"\r\n"); // ...and no terminating 0-chunk
+            out
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("rd-chunk-end-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("f.bin");
+        let opts = DownloadOpts {
+            concurrency: 2,
+            quiet: true,
+        };
+        let res = fetch(&url, &dest, opts).await;
+        let got = std::fs::read(&dest).ok();
+        std::fs::remove_dir_all(&dir).unwrap();
+        res.unwrap();
+        assert!(got.as_deref() == Some(&data[..]));
+    }
+
+    #[tokio::test]
+    async fn truncated_body_without_content_length_is_an_error() {
+        // The probe says 1000 bytes; the GET is a close-delimited 200 that
+        // stops after 500.
+        let url = raw_server(|head| {
+            if requested_range(head).is_some() {
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1000\r\nContent-Length: 1\r\n\r\nx".to_vec()
+            } else {
+                let mut out = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+                out.extend_from_slice(&[7u8; 500]);
+                out
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("rd-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("f.bin");
+        let opts = DownloadOpts {
+            concurrency: 1,
+            quiet: true,
+        };
+        let res = fetch(&url, &dest, opts).await;
+        let exists = dest.exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let err = res.unwrap_err();
+        assert!(format!("{err:#}").contains("short read"), "{err:#}");
+        assert!(!exists, "a truncated file was published");
+    }
+
+    #[test]
+    fn safe_filename_handles_windows_names() {
+        assert_eq!(safe_filename("C:evil.exe"), "C_evil.exe");
+        assert_eq!(safe_filename("a:b.mkv"), "a_b.mkv");
+        assert_eq!(safe_filename("what?.mkv"), "what_.mkv");
+        assert_eq!(safe_filename("NUL.txt"), "_NUL.txt");
+        assert_eq!(safe_filename("com1"), "_com1");
+        assert_eq!(safe_filename("console.txt"), "console.txt");
+        assert_eq!(safe_filename("name. "), "name");
+        assert_eq!(safe_filename("tab\there"), "tab_here");
+    }
+
+    #[test]
+    fn destination_never_overwrites_a_different_file() {
+        let dir = std::env::temp_dir().join(format!("rd-dest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("x.mkv");
+        let pick = |total| match pick_destination(&dest, Some(total)).unwrap() {
+            Destination::Finished(p) => {
+                format!("done {}", p.file_name().unwrap().to_string_lossy())
+            }
+            Destination::Write(p) => format!("write {}", p.file_name().unwrap().to_string_lossy()),
+        };
+        assert_eq!(pick(10), "write x.mkv");
+        std::fs::write(&dest, [0u8; 10]).unwrap();
+        assert_eq!(pick(10), "done x.mkv");
+        assert_eq!(pick(20), "write x (2).mkv");
+        std::fs::write(dir.join("x (2).mkv"), [0u8; 20]).unwrap();
+        assert_eq!(pick(20), "done x (2).mkv");
+        // A partial download of ours is resumed, not skipped.
+        std::fs::write(dir.join("x.mkv.rdpart"), b"{}").unwrap();
+        assert_eq!(pick(10), "write x.mkv");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

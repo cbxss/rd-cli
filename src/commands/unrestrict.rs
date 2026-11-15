@@ -13,9 +13,13 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
     // Fails fast, before touching the network, if there is no token.
     let client = Client::from_config()?;
 
+    let bulk = Path::new(&args.link).is_file();
     let links = collect_links(&args.link)?;
     if links.is_empty() {
         anyhow::bail!("no links found in {}", args.link);
+    }
+    if bulk && args.output_file.is_some() {
+        anyhow::bail!("-O/--output-file only works with a single link, not a file of links");
     }
 
     let mut successes: Vec<UnrestrictedLink> = Vec::new();
@@ -50,7 +54,7 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
         // Bulk (file) mode always prints an array, even if it only contained a
         // single link; a single link passed directly on the command line
         // prints a bare object.
-        if links.len() == 1 {
+        if !bulk {
             if let Some(ul) = successes.first() {
                 output::print_json(ul)?;
             }
@@ -79,16 +83,17 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
             .with_context(|| format!("failed to create output directory {}", out_dir.display()))?;
     }
 
-    // -O only makes sense when exactly one file will end up being downloaded;
-    // with more than one result we ignore it and use each link's own filename.
-    let single = successes.len() == 1;
+    // Several links can resolve to the same file name; give each its own.
+    let mut claimed = std::collections::HashSet::new();
 
     for ul in &successes {
         // -O is the user's own choice and may include a path; the filename
         // Real-Debrid returns is not, so it's reduced to a bare file name.
-        let filename = match (&args.output_file, single) {
-            (Some(name), true) => name.clone(),
-            _ => download::safe_filename(&ul.filename),
+        let filename = match &args.output_file {
+            Some(name) => name.clone(),
+            None => {
+                crate::torrent::unique_name(&mut claimed, &download::safe_filename(&ul.filename))
+            }
         };
         let dest = out_dir.join(&filename);
 
@@ -146,7 +151,7 @@ fn collect_links(link_arg: &str) -> Result<Vec<String>> {
             .with_context(|| format!("failed to read link file {}", path.display()))?;
         Ok(contents
             .lines()
-            .map(str::trim)
+            .map(|line| line.trim_start_matches('\u{feff}').trim())
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .map(str::to_string)
             .collect())
@@ -177,7 +182,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            "https://a.example.com/1\n\n# a comment\n  https://b.example.com/2  \n",
+            "\u{feff}https://a.example.com/1\n\n# a comment\n  https://b.example.com/2  \n",
         )
         .unwrap();
 

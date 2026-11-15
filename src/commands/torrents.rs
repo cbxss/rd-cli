@@ -121,9 +121,11 @@ async fn select_inner(client: &Client, id: String, files: String) -> Result<()> 
     .await?;
     if !selected {
         println!(
-            "Torrent {id} is '{}', not waiting for a file selection; keeping its current selection.",
+            "Torrent {id} is '{}', not waiting for a file selection; its selection was not changed. \
+             Download it with `rd dl {id} -o <dir>`.",
             info.status
         );
+        return Ok(());
     }
 
     if info.links.is_empty() {

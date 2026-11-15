@@ -160,6 +160,8 @@ struct Inner {
     premature_selects: u32,
     /// `(start, end)` of every non-probe ranged file request.
     ranges: Vec<(u64, u64)>,
+    /// Every file request except the 1-byte probe, ranged or not.
+    file_gets: u32,
     unrestricts: u64,
     /// When set, unrestricted links point here (`{base}/{file name}`)
     /// instead of at the fake's own file server.
@@ -262,6 +264,11 @@ impl Fake {
 
     pub fn torrent_count(&self) -> usize {
         self.lock().torrents.len()
+    }
+
+    /// Takes (and clears) the count of file requests other than probes.
+    pub fn take_file_gets(&self) -> u32 {
+        std::mem::take(&mut self.lock().file_gets)
     }
 
     /// Takes (and clears) the ranged file requests seen so far.
@@ -542,6 +549,9 @@ async fn serve_file(
     let total = data.len() as u64;
     let range = parse_range(&headers).filter(|&(s, e)| s <= e && e < total);
     let is_probe = range == Some((0, 0));
+    if !is_probe {
+        f.lock().file_gets += 1;
+    }
     if let Some(r) = range.filter(|_| !is_probe) {
         f.lock().ranges.push(r);
         if let Some(code) = fail_with {

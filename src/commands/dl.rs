@@ -130,6 +130,7 @@ async fn run_existing(args: DlArgs) -> Result<()> {
             };
             download::fetch(&entry.download, &dest, opts)
                 .await
+                .map(|_| ())
                 .with_context(|| format!("failed to download {}", entry.filename))
         }
         Err(err) => Err(err.into()),

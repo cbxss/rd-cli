@@ -28,6 +28,9 @@ futures-util = "0.3"
 rpassword = "7"
 fs4 = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Only for the Docker-based tests (`cargo test --features container-tests --test containers`).
 testcontainers = { version = "0.28", features = ["blocking"], optional = true }
 
