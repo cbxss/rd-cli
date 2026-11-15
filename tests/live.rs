@@ -30,6 +30,11 @@ struct Out {
 }
 
 fn rd(dir: &Path, args: &[&str]) -> Out {
+    rd_with(dir, args, true)
+}
+
+/// `echo: false` keeps account listings out of the test output.
+fn rd_with(dir: &Path, args: &[&str], echo: bool) -> Out {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rd"));
     cmd.args(args).current_dir(dir).stdin(Stdio::null());
     // Never inherit test-only overrides from the shell.
@@ -51,17 +56,21 @@ fn rd(dir: &Path, args: &[&str]) -> Out {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     };
+    let shown = if echo {
+        out.stdout.as_str()
+    } else {
+        "(output hidden)\n"
+    };
     eprintln!(
-        "--- rd {args:?} ({:.1}s)\n{}{}",
+        "--- rd {args:?} ({:.1}s)\n{shown}{}",
         started.elapsed().as_secs_f64(),
-        out.stdout,
         out.stderr
     );
     out
 }
 
 fn torrents_with_hash(dir: &Path, hash: &str) -> Vec<serde_json::Value> {
-    let out = rd(dir, &["torrents", "list", "--json"]);
+    let out = rd_with(dir, &["torrents", "list", "--json"], false);
     assert!(out.ok, "{}", out.stderr);
     let all: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).unwrap();
     all.into_iter()
@@ -116,7 +125,7 @@ fn live_read_only() {
         &["traffic", "--json"],
         &["hosts", "--json"],
     ] {
-        let out = rd(dir.path(), args);
+        let out = rd_with(dir.path(), args, false);
         assert!(out.ok, "rd {args:?}: {}", out.stderr);
         serde_json::from_str::<serde_json::Value>(&out.stdout)
             .unwrap_or_else(|e| panic!("rd {args:?} printed invalid JSON: {e}"));
@@ -176,11 +185,32 @@ fn live_download_round_trip() {
         .expect("torrent is downloaded");
     let id = torrent["id"].as_str().unwrap().to_string();
     let expected = torrent["bytes"].as_u64().unwrap();
-    let got = dir_size(&dir.path().join("one"));
-    assert_eq!(
-        got, expected,
-        "downloaded bytes vs. the torrent's selected size"
+    let one = dir.path().join("one");
+    let names: Vec<String> = std::fs::read_dir(&one)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let got = dir_size(&one);
+    // Real-Debrid sometimes delivers a multi-file torrent as one .rar
+    // (stored, uncompressed): the content plus a little archive overhead.
+    let archived = names.len() == 1 && names[0].ends_with(".rar");
+    eprintln!(
+        "delivered as {}: {names:?}, {got} bytes for {expected} selected",
+        if archived {
+            "an archive"
+        } else {
+            "separate files"
+        }
     );
+    let ok = if archived {
+        got >= expected && got - expected < 1024 * 1024
+    } else {
+        got == expected
+    };
+    if !ok {
+        rd(dir.path(), &["torrents", "info", &id]);
+        panic!("downloaded {got} bytes in {names:?}, torrent has {expected} selected");
+    }
 
     // 2. Rerun: same torrent, nothing fetched again.
     let out = rd(dir.path(), &["dl", &magnet, "-o", "one"]);
@@ -204,5 +234,9 @@ fn live_download_round_trip() {
         &["dl", &id, "-o", "two", "-j", "1", "--concurrency", "32"],
     );
     assert!(out.ok, "{}", out.stderr);
-    assert_eq!(dir_size(&dir.path().join("two")), expected);
+    assert_eq!(
+        dir_size(&dir.path().join("two")),
+        got,
+        "second download differs"
+    );
 }
