@@ -159,7 +159,7 @@ pub enum TorrentsCommand {
         magnet_or_file: String,
         #[arg(long)]
         host: Option<String>,
-        /// Select files immediately: "all" or a comma-separated list of file ids
+        /// Select files once the magnet is converted: "all" or comma-separated file ids (download with `rd dl <id>`)
         #[arg(long)]
         select: Option<String>,
     },
@@ -172,7 +172,7 @@ pub enum TorrentsCommand {
     },
     /// Show torrent details
     Info { id: String },
-    /// Select which files to download from a torrent
+    /// Choose which files of a torrent Real-Debrid fetches ("all" or comma-separated file ids); download with `rd dl <id>`
     Select { id: String, files: String },
     /// Delete a torrent
     Delete { id: String },

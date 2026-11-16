@@ -58,6 +58,21 @@ pub async fn get_info(client: &Client, id: &str) -> Result<TorrentInfo> {
     }
 }
 
+/// `get_info` for the polling loops: a temporary failure (network trouble,
+/// a 5xx, rate limiting) is reported as `Ok(None)` so a long wait survives a
+/// short Real-Debrid outage; the stall timeout decides when to give up.
+async fn poll_info(client: &Client, id: &str) -> Result<Option<TorrentInfo>> {
+    match client.get_json(&format!("/torrents/info/{id}")).await {
+        Ok(info) => Ok(Some(info)),
+        Err(err) if is_not_found(&err) => anyhow::bail!(
+            "torrent {id} not found on this account — it may have been deleted (see `rd torrents list`)"
+        ),
+        Err(RdError::Http(_) | RdError::RateLimited) => Ok(None),
+        Err(RdError::Api { status, .. }) if status >= 500 => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 // ---- adding ----
 
 /// Extracts the lowercase hex info-hash from a magnet's `xt=urn:btih:`
@@ -179,13 +194,13 @@ async fn add_magnet(
     client: &Client,
     link: &str,
     host: Option<&str>,
+    hash: Option<String>,
     before: Option<Vec<String>>,
 ) -> Result<String> {
     let mut form: Vec<(&str, &str)> = vec![("magnet", link)];
     if let Some(h) = host {
         form.push(("host", h));
     }
-    let hash = magnet_hash(link);
     let before = match (&hash, before) {
         (Some(_), Some(ids)) => ids,
         (Some(h), None) => ids_with_hash(&list_torrents(client).await?, h),
@@ -227,9 +242,10 @@ async fn add_magnet(
 
 /// Adds a magnet link or `.torrent` file; returns the new torrent's ID.
 pub async fn add(client: &Client, link: &str, host: Option<&str>) -> Result<String> {
-    let resp: AddMagnetResponse = if link.starts_with("magnet:") {
-        return add_magnet(client, link, host, None).await;
-    } else {
+    if link.starts_with("magnet:") {
+        return add_magnet(client, link, host, magnet_hash(link), None).await;
+    }
+    let resp: AddMagnetResponse = {
         let bytes = tokio::fs::read(link)
             .await
             .with_context(|| format!("failed to read torrent file {link}"))?;
@@ -258,18 +274,19 @@ pub async fn add_or_reuse(
             if let Some(existing) = find_existing(client, &torrents, &hash).await? {
                 if !quiet {
                     download::status(&format!(
-                        "Reusing existing torrent: {} ({})",
+                        "reusing existing torrent {} ({})",
                         existing.id, existing.status
                     ));
                 }
                 return Ok(existing.id);
             }
-            add_magnet(client, link, host, Some(ids_with_hash(&torrents, &hash))).await?
+            let before = ids_with_hash(&torrents, &hash);
+            add_magnet(client, link, host, Some(hash), Some(before)).await?
         }
         None => add(client, link, host).await?,
     };
     if !quiet {
-        download::status(&format!("Added torrent: {id}"));
+        download::status(&format!("added torrent {id}"));
     }
     Ok(id)
 }
@@ -327,6 +344,19 @@ impl StallGuard {
     }
 }
 
+impl StallGuard {
+    /// Called when a poll failed temporarily: no news counts as no progress.
+    fn check_unreachable(&self, id: &str) -> Result<()> {
+        match self.timeout {
+            Some(timeout) if self.since.elapsed() >= timeout => anyhow::bail!(
+                "couldn't reach Real-Debrid for {} while waiting on torrent {id}; run `rd dl {id}` to keep waiting",
+                human_duration(timeout)
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
 fn human_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 60 && secs % 60 == 0 {
@@ -357,7 +387,11 @@ pub async fn select_when_ready(
     let mut announced = false;
     let mut guard = StallGuard::new(stall);
     loop {
-        let info = get_info(client, id).await?;
+        let Some(info) = poll_info(client, id).await? else {
+            guard.check_unreachable(id)?;
+            tokio::time::sleep(poll_interval()).await;
+            continue;
+        };
         match info.status.as_str() {
             "magnet_conversion" => {
                 guard.check(id, &info)?;
@@ -392,7 +426,11 @@ pub async fn wait_for_links(
     let mut empty_links = 0u32;
     let mut last_line = String::new();
     loop {
-        let info = get_info(client, id).await?;
+        let Some(info) = poll_info(client, id).await? else {
+            guard.check_unreachable(id)?;
+            tokio::time::sleep(poll_interval()).await;
+            continue;
+        };
 
         match info.status.as_str() {
             "downloaded" if !info.links.is_empty() => return Ok(info),
@@ -540,7 +578,15 @@ async fn run_pass<'a>(
     }
 
     let results: Vec<(&String, Result<()>)> = stream::iter(work)
-        .map(|(link, ul, dest)| async move { (link, fetch_unrestricted(&ul, &dest, opts).await) })
+        .map(|(link, ul, dest)| async move {
+            let opts = DownloadOpts {
+                concurrency: opts.concurrency,
+                quiet: opts.quiet,
+            };
+            let res =
+                download::fetch_file(&ul.download, &ul.filename, ul.chunks, &dest, opts).await;
+            (link, res.map(|_| ()))
+        })
         .buffer_unordered(jobs)
         .collect()
         .await;
@@ -550,24 +596,6 @@ async fn run_pass<'a>(
             .filter_map(|(link, res)| res.err().map(|e| (link, e))),
     );
     failures
-}
-
-async fn fetch_unrestricted(ul: &UnrestrictedLink, dest: &Path, opts: LinkOpts) -> Result<()> {
-    if !opts.quiet {
-        download::status(&format!(
-            "downloading {} -> {}",
-            ul.filename,
-            dest.display()
-        ));
-    }
-    let dl_opts = DownloadOpts {
-        concurrency: cap_connections(opts.concurrency, ul.chunks),
-        quiet: opts.quiet,
-    };
-    download::fetch(&ul.download, dest, dl_opts)
-        .await
-        .map(|_| ())
-        .with_context(|| format!("failed to download {}", ul.filename))
 }
 
 /// Output names for the links of one download. Files in different torrent
@@ -585,39 +613,10 @@ impl Names {
         if let Some(existing) = self.by_link.get(link) {
             return existing.clone();
         }
-        let unique = unique_name(&mut self.taken, name);
+        let unique = download::unique_name(&mut self.taken, name);
         self.by_link.insert(link.to_string(), unique.clone());
         unique
     }
-}
-
-/// Real-Debrid reports how many parallel connections ("chunks") a link allows;
-/// opening more risks refused or throttled requests.
-pub fn cap_connections(requested: usize, allowed: i64) -> usize {
-    if allowed > 0 {
-        requested.min(allowed as usize).max(1)
-    } else {
-        requested.max(1)
-    }
-}
-
-/// `name`, or `name (2).ext`, `name (3).ext`, ... if already taken. Compared
-/// case-insensitively, since Windows and macOS filesystems are.
-pub fn unique_name(claimed: &mut HashSet<String>, name: &str) -> String {
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
-        _ => (name, String::new()),
-    };
-    (1..)
-        .map(|n| {
-            if n == 1 {
-                name.to_string()
-            } else {
-                format!("{stem} ({n}){ext}")
-            }
-        })
-        .find(|candidate| claimed.insert(candidate.to_lowercase()))
-        .expect("unbounded")
 }
 
 #[cfg(test)]
@@ -675,20 +674,6 @@ mod tests {
             magnet_hash(&format!("magnet:?xt=urn%3Abtih%3A{h}")).as_deref(),
             Some(h.to_ascii_lowercase().as_str())
         );
-    }
-
-    #[test]
-    fn unique_names_and_connection_caps() {
-        let mut claimed = HashSet::new();
-        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x.mkv");
-        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x (2).mkv");
-        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x (3).mkv");
-        assert_eq!(unique_name(&mut claimed, "README"), "README");
-        assert_eq!(unique_name(&mut claimed, "README"), "README (2)");
-        assert_eq!(unique_name(&mut claimed, "X.MKV"), "X (4).MKV");
-        assert_eq!(cap_connections(8, 4), 4);
-        assert_eq!(cap_connections(8, 0), 8);
-        assert_eq!(cap_connections(0, 16), 1);
     }
 
     fn listed(id: &str, hash: &str) -> serde_json::Value {
@@ -964,6 +949,57 @@ mod tests {
         wait_for_links(&client, "ABC", "all", true, Some(Duration::from_millis(30)))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_debrid_stages_are_not_stalls() {
+        let server = MockServer::start().await;
+        let mut seq = vec![info_at("queued", 0.0); 30];
+        seq.push(info("downloaded", &["https://real-debrid.com/d/X"]));
+        mount_info_sequence(&server, &seq).await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        wait_for_links(&client, "ABC", "all", true, Some(Duration::from_millis(30)))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_short_outage_while_waiting_is_ridden_out() {
+        let server = MockServer::start().await;
+        // Every poll fails for a while (each failed poll is retried by the
+        // client, so this is a sustained outage), then the torrent is done.
+        Mock::given(method("GET"))
+            .and(path("/torrents/info/ABC"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(12)
+            .mount(&server)
+            .await;
+        mount_info_sequence(
+            &server,
+            &[info("downloaded", &["https://real-debrid.com/d/X"])],
+        )
+        .await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let got = wait_for_links(&client, "ABC", "all", true, None)
+            .await
+            .unwrap();
+        assert_eq!(got.status, "downloaded");
+
+        // ...but not forever, when a stall timeout is set.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/torrents/info/ABC"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let err = wait_for_links(&client, "ABC", "all", true, Some(Duration::from_millis(1)))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("couldn't reach Real-Debrid"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

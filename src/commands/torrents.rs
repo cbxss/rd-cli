@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::api::Client;
 use crate::api::models::{Torrent, TorrentInfo};
 use crate::output;
-use crate::torrent::{self, LinkOpts};
+use crate::torrent;
 
 fn client() -> Result<Client> {
     Client::from_config()
@@ -17,7 +17,7 @@ pub async fn add(
     let client = client()?;
 
     let id = torrent::add(&client, &magnet_or_file, host.as_deref()).await?;
-    println!("Added torrent: {id}");
+    println!("added torrent {id}");
 
     if let Some(files) = select {
         select_inner(&client, id, files).await?;
@@ -58,7 +58,7 @@ pub async fn list(filter: Option<String>, json: bool) -> Result<()> {
 
 pub async fn info(id: String) -> Result<()> {
     let client = client()?;
-    let info: TorrentInfo = client.get_json(&format!("/torrents/info/{id}")).await?;
+    let info: TorrentInfo = torrent::get_info(&client, &id).await?;
 
     println!("ID:       {}", info.id);
     println!("Filename: {}", info.filename);
@@ -110,6 +110,8 @@ pub async fn select(id: String, files: String) -> Result<()> {
     select_inner(&client, id, files).await
 }
 
+/// Selects files once Real-Debrid is ready for it. Never downloads: that's
+/// `rd dl <id>`, with its output directory and options.
 async fn select_inner(client: &Client, id: String, files: String) -> Result<()> {
     let (info, selected) = torrent::select_when_ready(
         client,
@@ -119,29 +121,16 @@ async fn select_inner(client: &Client, id: String, files: String) -> Result<()> 
         Some(torrent::DEFAULT_STALL_TIMEOUT),
     )
     .await?;
-    if !selected {
+    if selected {
+        println!("Selected files {files}; torrent {id} is '{}'.", info.status);
+    } else {
         println!(
-            "Torrent {id} is '{}', not waiting for a file selection; its selection was not changed. \
-             Download it with `rd dl {id} -o <dir>`.",
+            "Torrent {id} is '{}', not waiting for a file selection; its selection was not changed.",
             info.status
         );
-        return Ok(());
     }
-
-    if info.links.is_empty() {
-        println!(
-            "Torrent status is '{}' — no download links available yet; run `rd dl {id}` to wait for it and download.",
-            info.status
-        );
-        return Ok(());
-    }
-
-    let opts = LinkOpts {
-        quiet: false,
-        concurrency: 8,
-        jobs: 3,
-    };
-    torrent::download_links(client, &info.links, std::path::Path::new("."), opts).await
+    println!("Download it with `rd dl {id} -o <dir>`.");
+    Ok(())
 }
 
 pub async fn delete(id: String) -> Result<()> {

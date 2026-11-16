@@ -1,6 +1,12 @@
+//! Downloading one file to disk: picking a safe destination, probing the
+//! server, then either a plain stream (small files, no range support) or
+//! resumable parallel chunks (large files).
+
+use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -11,33 +17,31 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadOpts {
-    /// Max concurrent range requests for the segmented path.
+    /// Max parallel range requests per file.
     pub concurrency: usize,
-    /// Suppress the progress bar.
+    /// Suppress status lines and progress bars.
     pub quiet: bool,
 }
 
-impl Default for DownloadOpts {
-    fn default() -> Self {
-        Self {
-            concurrency: 8,
-            quiet: false,
-        }
-    }
-}
-
-/// Below this size we don't bother segmenting even if the server supports
-/// ranges - the overhead of spawning multiple connections isn't worth it.
+/// Files at least this big use the chunked path, which is resumable (even
+/// with one connection); smaller ones are fetched in one stream.
 const SEGMENT_THRESHOLD: u64 = 50 * 1024 * 1024;
 
-/// Size of each range request in the segmented path. Fixed-size chunks (rather
+/// Size of each range request in the chunked path. Fixed-size chunks (rather
 /// than one segment per connection) keep a failed attempt and an interrupted
-/// run cheap: at most one chunk per connection is lost, which matters for
-/// multi-hundred-GB files, and resume works regardless of `--concurrency`.
+/// run cheap — at most one chunk per connection is lost, which matters for
+/// multi-hundred-GB files — and resume works regardless of `--concurrency`.
 const CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Number of attempts (including the first) for each segment before giving up.
+/// Attempts for a probe or a whole single-stream download; for a chunk, the
+/// number of consecutive attempts that make no progress.
 const MAX_ATTEMPTS: u32 = 5;
+
+/// Longest file name we create, in bytes. Most filesystems allow 255; the
+/// rest is headroom for ` (n)` and the `.rdpart.tmp` / `.rdtmp` suffixes.
+const MAX_NAME_BYTES: usize = 200;
+
+// ---- shared process state ----
 
 /// One HTTP client for every download in the process, so connections (and
 /// TLS sessions) to the same download server are reused across files.
@@ -64,18 +68,49 @@ pub fn status(msg: &str) {
     bars().suspend(|| println!("{msg}"));
 }
 
-/// An error that retrying won't fix (an expired link, a server that ignores
-/// ranges), so the download stops instead of burning through retries.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct Fatal(String);
+/// Paths being written by this process right now. Two downloads must never
+/// pick the same file (or its `.rdpart` / `.rdtmp`), whatever their names.
+fn in_use() -> &'static Mutex<HashSet<PathBuf>> {
+    static IN_USE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    IN_USE.get_or_init(Default::default)
+}
 
-fn is_fatal(err: &anyhow::Error) -> bool {
-    err.chain().any(|e| e.is::<Fatal>())
+/// A path reserved in [`in_use`] until dropped.
+struct Claim(PathBuf);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        in_use()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
+
+// ---- errors and retries ----
+
+/// Failures that retrying the same request won't fix.
+#[derive(Debug, thiserror::Error)]
+enum Permanent {
+    /// E.g. an expired link (403/404).
+    #[error("{0}")]
+    Fatal(String),
+    /// The server answered a range request with something else; the file
+    /// can still be fetched in one stream.
+    #[error("{0}")]
+    RangesIgnored(String),
+}
+
+fn permanent(err: &anyhow::Error) -> Option<&Permanent> {
+    err.chain().find_map(|e| e.downcast_ref::<Permanent>())
+}
+
+fn is_permanent(err: &anyhow::Error) -> bool {
+    permanent(err).is_some()
 }
 
 /// Like `error_for_status`, but 4xx responses (other than timeouts and rate
-/// limits) are [`Fatal`].
+/// limits) are [`Permanent::Fatal`].
 fn check_status(resp: Response, what: &str) -> Result<Response> {
     let status = resp.status();
     if status.is_success() {
@@ -86,7 +121,7 @@ fn check_status(resp: Response, what: &str) -> Result<Response> {
         && status != StatusCode::REQUEST_TIMEOUT
         && status != StatusCode::TOO_MANY_REQUESTS
     {
-        return Err(Fatal(msg).into());
+        return Err(Permanent::Fatal(msg).into());
     }
     Err(anyhow::anyhow!(msg))
 }
@@ -95,14 +130,31 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(200 * 2u64.pow(attempt.saturating_sub(1).min(6)))
 }
 
+/// Runs `attempt` up to [`MAX_ATTEMPTS`] times, backing off between
+/// transient failures.
+async fn retrying<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut n = 0;
+    loop {
+        n += 1;
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_permanent(&e) || n >= MAX_ATTEMPTS => return Err(e),
+            Err(_) => tokio::time::sleep(retry_delay(n)).await,
+        }
+    }
+}
+
+// ---- disk space ----
+
 /// Fails before any data is fetched when the destination's filesystem can't
 /// hold the `needed` bytes still to download. If free space can't be
 /// determined, the download goes ahead.
 fn ensure_space(dest: &Path, needed: u64) -> Result<()> {
-    let dir = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let dir = parent_dir(dest);
     match fs4::available_space(dir) {
         Ok(free) => check_space(needed, free, dir),
         Err(_) => Ok(()),
@@ -121,12 +173,46 @@ fn check_space(needed: u64, free: u64, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bytes the filesystem has actually allocated to `path` (preallocation is
+/// sparse on most Unix filesystems but not on NTFS).
+fn allocated_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::blocks(&meta) * 512
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Creates `-o`'s directory if one was given; defaults to the current one.
+pub fn prepare_out_dir(output_dir: Option<&str>) -> Result<PathBuf> {
+    let Some(dir) = output_dir else {
+        return Ok(PathBuf::from("."));
+    };
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create output directory {dir}"))?;
+    Ok(PathBuf::from(dir))
+}
+
+// ---- names ----
+
 /// Reduces a server-supplied file name to one portable path component, so it
 /// can't escape the output directory or misbehave on any OS: path separators
 /// and characters Windows forbids (`<>:"|?*`, control characters) become `_`
 /// (`C:x` would otherwise be a drive-relative path, `a:b` an NTFS stream),
-/// trailing dots and spaces go, and reserved device names (`CON`, `NUL.txt`,
-/// ...) get a `_` prefix.
+/// trailing dots and spaces go, reserved device names (`CON`, `NUL.txt`,
+/// ...) get a `_` prefix, and over-long names are shortened.
 pub fn safe_filename(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
@@ -146,16 +232,66 @@ pub fn safe_filename(name: &str) -> String {
         || ((stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.len() == 4
             && stem.as_bytes()[3].is_ascii_digit());
-    if reserved {
+    let named = if reserved {
         format!("_{cleaned}")
     } else {
         cleaned
+    };
+    shorten(&named, MAX_NAME_BYTES)
+}
+
+/// Cuts `name` to at most `max` bytes on a character boundary, keeping a
+/// short extension.
+fn shorten(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && e.len() <= 16 => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    let mut cut = max - ext.len();
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{ext}", &stem[..cut])
+}
+
+/// `name` for n = 1, else `stem (n).ext`.
+fn numbered_name(name: &str, n: u32) -> String {
+    if n == 1 {
+        return name.to_string();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
     }
 }
 
+/// The first of `name`, `name (2).ext`, ... not yet in `claimed`. Compared
+/// case-insensitively, since Windows and macOS filesystems are.
+pub fn unique_name(claimed: &mut HashSet<String>, name: &str) -> String {
+    (1..)
+        .map(|n| numbered_name(name, n))
+        .find(|candidate| claimed.insert(candidate.to_lowercase()))
+        .expect("unbounded")
+}
+
+/// Real-Debrid reports how many parallel connections ("chunks") a link allows;
+/// opening more risks refused or throttled requests.
+pub fn cap_connections(requested: usize, allowed: i64) -> usize {
+    if allowed > 0 {
+        requested.min(allowed as usize).max(1)
+    } else {
+        requested.max(1)
+    }
+}
+
+// ---- resume state ----
+
+/// `<dest>.rdpart`: which chunks of a chunked download are on disk.
 #[derive(Debug, Serialize, Deserialize)]
 struct Sidecar {
-    url: String,
     total_size: u64,
     completed_ranges: Vec<(u64, u64)>,
 }
@@ -165,19 +301,13 @@ impl Sidecar {
         PathBuf::from(format!("{}.rdpart", dest.display()))
     }
 
-    /// Loads a sidecar for `dest` if it describes a file of the same size. The
-    /// URL is deliberately not compared: Real-Debrid can hand out a different
-    /// download URL each time a link is unrestricted, and discarding (and
-    /// truncating) hundreds of GB of progress because of that is far worse.
+    /// Loads the sidecar for `dest` if it describes a file of `total_size`
+    /// bytes. The download URL isn't part of it: Real-Debrid can hand out a
+    /// different URL each time a link is unrestricted.
     fn load(dest: &Path, total_size: u64) -> Option<Sidecar> {
-        let path = Self::path_for(dest);
-        let data = std::fs::read(&path).ok()?;
+        let data = std::fs::read(Self::path_for(dest)).ok()?;
         let sidecar: Sidecar = serde_json::from_slice(&data).ok()?;
-        if sidecar.total_size == total_size {
-            Some(sidecar)
-        } else {
-            None
-        }
+        (sidecar.total_size == total_size).then_some(sidecar)
     }
 
     /// Records a finished range, merging it with adjacent ones so the sidecar
@@ -201,32 +331,78 @@ impl Sidecar {
             .any(|&(cs, ce)| cs <= s && e <= ce)
     }
 
+    /// Write-then-rename, with the temp file synced first, so after a crash or
+    /// power cut the sidecar is the old or the new version, never empty.
     fn save(&self, dest: &Path) -> Result<()> {
         let path = Self::path_for(dest);
-        let data = serde_json::to_vec(self)?;
-        // Write-then-rename so an interrupt can't leave a half-written sidecar
-        // (which would be ignored, and the partial download truncated).
-        // The temp file is synced first so that after a power cut the sidecar
-        // is either the old or the new version, never empty.
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-        {
+        let write = || -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
-            std::io::Write::write_all(&mut f, &data)?;
+            std::io::Write::write_all(&mut f, &serde_json::to_vec(self)?)?;
             f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        #[cfg(unix)]
-        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-        }
-        Ok(())
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            std::fs::File::open(parent_dir(&path))?.sync_all()?;
+            Ok(())
+        };
+        write().with_context(|| format!("failed to save {}", path.display()))
     }
 
     fn delete(dest: &Path) {
-        let path = Self::path_for(dest);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(Self::path_for(dest));
     }
 }
+
+// ---- choosing the destination ----
+
+enum Picked {
+    /// A finished earlier download of this file.
+    Finished(PathBuf),
+    /// Where to write (resuming a partial download of ours if there is one).
+    Write(Claim),
+}
+
+/// Decides where a download of `total` bytes goes, trying `dest`, then
+/// `name (2).ext`, ...:
+/// - a path another download in this run is using is skipped;
+/// - a `.rdpart` for the same size is our partial download: resume it;
+///   one for another size belongs to a different file and is left alone;
+/// - a file of exactly `total` bytes (and no `.rdpart`) is a finished
+///   earlier download;
+/// - any other existing file is someone else's and is never overwritten.
+fn pick_destination(dest: &Path, total: Option<u64>) -> Result<Picked> {
+    let mut in_use = in_use().lock().unwrap_or_else(|p| p.into_inner());
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for n in 1..=1000 {
+        let candidate = dest.with_file_name(numbered_name(&name, n));
+        if in_use.contains(&candidate) {
+            continue;
+        }
+        if Sidecar::path_for(&candidate).exists() {
+            if total.is_some_and(|t| Sidecar::load(&candidate, t).is_some()) {
+                in_use.insert(candidate.clone());
+                return Ok(Picked::Write(Claim(candidate)));
+            }
+            continue;
+        }
+        match std::fs::metadata(&candidate) {
+            Err(_) => {
+                in_use.insert(candidate.clone());
+                return Ok(Picked::Write(Claim(candidate)));
+            }
+            Ok(m) if m.is_file() && Some(m.len()) == total => {
+                return Ok(Picked::Finished(candidate));
+            }
+            Ok(_) => continue,
+        }
+    }
+    anyhow::bail!("no free file name for {}", dest.display())
+}
+
+// ---- downloading ----
 
 /// Result of probing a URL for range support.
 struct ProbeResult {
@@ -266,102 +442,73 @@ async fn probe(client: &Client, url: &str) -> Result<ProbeResult> {
     })
 }
 
-/// [`probe`] with retries for transient failures.
-async fn probe_with_retry(client: &Client, url: &str) -> Result<ProbeResult> {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match probe(client, url).await {
-            Ok(p) => return Ok(p),
-            Err(e) if is_fatal(&e) || attempt >= MAX_ATTEMPTS => return Err(e),
-            Err(_) => tokio::time::sleep(retry_delay(attempt)).await,
-        }
-    }
-}
-
-enum Destination {
-    /// A finished earlier download of this file.
-    Finished(PathBuf),
-    /// Where to write (possibly resuming a partial download there).
-    Write(PathBuf),
-}
-
-/// `dest`, then `name (2).ext`, `name (3).ext`, ...
-fn numbered(dest: &Path, n: u32) -> PathBuf {
-    if n == 1 {
-        return dest.to_path_buf();
-    }
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let new = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
-        _ => format!("{name} ({n})"),
+/// Downloads `url` (shown as `label`) to `dest`, or to a numbered variant
+/// if a different file already has that name, and returns the path written.
+/// `chunks` is Real-Debrid's per-link connection limit (0 if unknown).
+pub async fn fetch_file(
+    url: &str,
+    label: &str,
+    chunks: i64,
+    dest: &Path,
+    opts: DownloadOpts,
+) -> Result<PathBuf> {
+    let opts = DownloadOpts {
+        concurrency: cap_connections(opts.concurrency, chunks),
+        ..opts
     };
-    dest.with_file_name(new)
+    fetch(url, label, dest, opts)
+        .await
+        .with_context(|| format!("failed to download {label}"))
 }
 
-/// Decides where a download of `total` bytes goes. A path with a `.rdpart`
-/// sidecar is a partial download of ours to resume; a file of exactly
-/// `total` bytes without one is a finished earlier download. Any other
-/// existing file belongs to something else and is never overwritten: the
-/// download moves to the next free `name (n).ext`.
-fn pick_destination(dest: &Path, total: Option<u64>) -> Result<Destination> {
-    for n in 1..=1000 {
-        let candidate = numbered(dest, n);
-        if Sidecar::path_for(&candidate).exists() {
-            return Ok(Destination::Write(candidate));
-        }
-        match std::fs::metadata(&candidate) {
-            Err(_) => return Ok(Destination::Write(candidate)),
-            Ok(m) if m.is_file() && Some(m.len()) == total => {
-                return Ok(Destination::Finished(candidate));
-            }
-            Ok(_) => continue,
-        }
-    }
-    anyhow::bail!("no free file name for {}", dest.display())
-}
-
-/// Downloads `url` to `dest` (or a numbered variant if a different file
-/// already has that name) and returns the path written. Streams straight to
-/// disk; large range-capable downloads use parallel chunked requests and are
-/// resumable through a `<dest>.rdpart` sidecar, everything else streams to
-/// `<dest>.rdtmp` and is renamed when complete.
-pub async fn fetch(url: &str, dest: &Path, opts: DownloadOpts) -> Result<PathBuf> {
+async fn fetch(url: &str, label: &str, dest: &Path, opts: DownloadOpts) -> Result<PathBuf> {
     let client = http()?;
-    let probe_result = probe_with_retry(client, url).await?;
+    let probed = retrying(|| probe(client, url)).await?;
 
-    let dest = match pick_destination(dest, probe_result.total_size)? {
-        Destination::Finished(path) => {
+    let claim = match pick_destination(dest, probed.total_size)? {
+        Picked::Finished(path) => {
             if !opts.quiet {
                 status(&format!("already downloaded: {}", path.display()));
             }
             return Ok(path);
         }
-        Destination::Write(path) => {
-            if path != dest && !opts.quiet {
+        Picked::Write(claim) => claim,
+    };
+    let path = claim.0.clone();
+    if !opts.quiet {
+        if path != dest {
+            status(&format!(
+                "{} already exists with different content; saving as {}",
+                dest.display(),
+                path.display()
+            ));
+        }
+        status(&format!("downloading {label} -> {}", path.display()));
+    }
+
+    let chunked_size = probed
+        .total_size
+        .filter(|&size| probed.supports_ranges && size >= SEGMENT_THRESHOLD);
+    let Some(total) = chunked_size else {
+        fetch_single_stream(client, url, &path, probed.total_size, opts).await?;
+        return Ok(path);
+    };
+    match fetch_segmented(client, url, &path, total, opts).await {
+        Err(e) if matches!(permanent(&e), Some(Permanent::RangesIgnored(_))) => {
+            if !opts.quiet {
                 status(&format!(
-                    "{} already exists with different content; saving as {}",
-                    dest.display(),
-                    path.display()
+                    "the server doesn't honour range requests; downloading {label} in one stream"
                 ));
             }
-            path
+            // The preallocated file and its sidecar are of no use now.
+            let _ = std::fs::remove_file(&path);
+            Sidecar::delete(&path);
+            fetch_single_stream(client, url, &path, Some(total), opts).await?;
         }
-    };
-
-    // Chunked whenever the server supports ranges, even with one connection:
-    // that is the resumable path.
-    let segmented_size = probe_result
-        .total_size
-        .filter(|&size| probe_result.supports_ranges && size > SEGMENT_THRESHOLD);
-    match segmented_size {
-        Some(total) => fetch_segmented(client, url, &dest, total, opts).await?,
-        None => fetch_single_stream(client, url, &dest, probe_result.total_size, opts).await?,
+        other => other?,
     }
-    Ok(dest)
+    drop(claim);
+    Ok(path)
 }
 
 fn make_progress_bar(total: Option<u64>, quiet: bool) -> ProgressBar {
@@ -410,17 +557,11 @@ async fn fetch_single_stream(
     }
     let tmp = PathBuf::from(format!("{}.rdtmp", dest.display()));
     let pb = make_progress_bar(total_size, opts.quiet);
-
-    let mut attempt = 0u32;
-    let result = loop {
-        attempt += 1;
+    let result = retrying(|| {
         pb.set_position(0);
-        match single_stream_once(client, url, &tmp, total_size, &pb).await {
-            Ok(()) => break Ok(()),
-            Err(e) if is_fatal(&e) || attempt >= MAX_ATTEMPTS => break Err(e),
-            Err(_) => tokio::time::sleep(retry_delay(attempt)).await,
-        }
-    };
+        single_stream_once(client, url, &tmp, total_size, &pb)
+    })
+    .await;
     pb.finish_and_clear();
 
     if let Err(e) = result {
@@ -498,11 +639,9 @@ async fn fetch_segmented(
 ) -> Result<()> {
     let all_ranges = split_ranges(total_size, CHUNK_SIZE);
 
-    // Preallocate/open the file. If resuming, don't truncate what's there.
     let existing_sidecar = Sidecar::load(dest, total_size).filter(|_| dest.exists());
     let resuming = existing_sidecar.is_some();
     let sidecar = Sidecar {
-        url: url.to_string(),
         total_size,
         completed_ranges: existing_sidecar
             .map(|s| s.completed_ranges)
@@ -515,11 +654,17 @@ async fn fetch_segmented(
     let already_done_bytes: u64 = done_ranges.iter().map(|(s, e)| e - s + 1).sum();
 
     // Check before preallocating: on many filesystems the preallocation is
-    // sparse, so a full disk would otherwise only show up hours in.
-    ensure_space(dest, total_size - already_done_bytes)?;
+    // sparse, so a full disk would otherwise only show up hours in. Space the
+    // partial file already occupies (all of it, on NTFS) isn't needed again.
+    let occupied = if resuming { allocated_bytes(dest) } else { 0 };
+    ensure_space(
+        dest,
+        total_size - already_done_bytes.max(occupied).min(total_size),
+    )?;
 
     // Save the sidecar before creating the file: a full-size file without
-    // one would look finished to the "already downloaded" check.
+    // one would look finished to the "already downloaded" check. Then
+    // preallocate (keeping what's there when resuming).
     sidecar.save(dest)?;
     {
         let file = std::fs::OpenOptions::new()
@@ -653,7 +798,7 @@ async fn download_segment(
                     .context("failed to flush chunk to disk")?;
                 return Ok(());
             }
-            Err(e) if is_fatal(&e) => return Err(e),
+            Err(e) if is_permanent(&e) => return Err(e),
             Err(_) if start + written > end => continue,
             Err(e) => {
                 if stalled_attempts >= MAX_ATTEMPTS {
@@ -693,8 +838,8 @@ async fn download_range_once(
         // Writing a non-ranged (200) body or a different range at `start`
         // would silently corrupt the file, so insist on exactly this range.
         if resp.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(Fatal(format!(
-                "server ignored the range request for {start}-{end} (HTTP {}); retry with --concurrency 1",
+            return Err(Permanent::RangesIgnored(format!(
+                "server ignored the range request for {start}-{end} (HTTP {})",
                 resp.status()
             ))
             .into());
@@ -705,7 +850,7 @@ async fn download_range_once(
             .and_then(|v| v.to_str().ok())
             .and_then(parse_content_range);
         if served != Some((start, end)) {
-            return Err(Fatal(format!(
+            return Err(Permanent::RangesIgnored(format!(
                 "server returned the wrong range for {start}-{end} ({served:?})"
             ))
             .into());
@@ -797,7 +942,6 @@ mod tests {
     #[test]
     fn sidecar_merges_and_covers() {
         let mut sc = Sidecar {
-            url: String::new(),
             total_size: 30,
             completed_ranges: vec![],
         };
@@ -831,48 +975,40 @@ mod tests {
         server
     }
 
-    fn temp_dest(tag: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("rd-dl-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("out.bin");
+    fn temp_dest() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
         (dir, dest)
     }
 
     #[tokio::test]
-    async fn segmented_download_rejects_ignored_ranges() {
+    async fn server_ignoring_ranges_falls_back_to_one_stream() {
         let total = (SEGMENT_THRESHOLD + 10) as usize;
-        let server = range_ignoring_server(vec![7u8; total]).await;
-        let (dir, dest) = temp_dest("norange");
+        let data: Vec<u8> = (0..total).map(|i| (i % 249) as u8).collect();
+        let server = range_ignoring_server(data.clone()).await;
+        let (_dir, dest) = temp_dest();
         let opts = DownloadOpts {
             concurrency: 2,
             quiet: true,
         };
-        let err = fetch(&server.uri(), &dest, opts).await.unwrap_err();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(
-            format!("{err:#}").contains("ignored the range request"),
-            "{err:#}"
-        );
+        let path = fetch(&server.uri(), "out.bin", &dest, opts).await.unwrap();
+        assert_eq!(path, dest);
+        assert!(std::fs::read(&dest).unwrap() == data);
+        assert!(!Sidecar::path_for(&dest).exists());
     }
 
     #[tokio::test]
     async fn finished_file_is_not_downloaded_again() {
         let data = vec![1u8; 1000];
         let server = range_ignoring_server(data.clone()).await;
-        let (dir, dest) = temp_dest("done");
+        let (_dir, dest) = temp_dest();
         std::fs::write(&dest, &data).unwrap();
-        fetch(
-            &server.uri(),
-            &dest,
-            DownloadOpts {
-                concurrency: 1,
-                quiet: true,
-            },
-        )
-        .await
-        .unwrap();
+        let opts = DownloadOpts {
+            concurrency: 1,
+            quiet: true,
+        };
+        fetch(&server.uri(), "out.bin", &dest, opts).await.unwrap();
         let requests = server.received_requests().await.unwrap().len();
-        std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(requests, 1, "only the probe should hit the server");
     }
 
@@ -949,14 +1085,14 @@ mod tests {
             out
         })
         .await;
-        let dir = std::env::temp_dir().join(format!("rd-chunk-end-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir = tmpdir.path().to_path_buf();
         let dest = dir.join("f.bin");
         let opts = DownloadOpts {
             concurrency: 2,
             quiet: true,
         };
-        let res = fetch(&url, &dest, opts).await;
+        let res = fetch(&url, "f.bin", &dest, opts).await;
         let got = std::fs::read(&dest).ok();
         std::fs::remove_dir_all(&dir).unwrap();
         res.unwrap();
@@ -977,14 +1113,14 @@ mod tests {
             }
         })
         .await;
-        let dir = std::env::temp_dir().join(format!("rd-trunc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir = tmpdir.path().to_path_buf();
         let dest = dir.join("f.bin");
         let opts = DownloadOpts {
             concurrency: 1,
             quiet: true,
         };
-        let res = fetch(&url, &dest, opts).await;
+        let res = fetch(&url, "f.bin", &dest, opts).await;
         let exists = dest.exists();
         std::fs::remove_dir_all(&dir).unwrap();
         let err = res.unwrap_err();
@@ -1006,25 +1142,77 @@ mod tests {
 
     #[test]
     fn destination_never_overwrites_a_different_file() {
-        let dir = std::env::temp_dir().join(format!("rd-dest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("x.mkv");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.mkv");
         let pick = |total| match pick_destination(&dest, Some(total)).unwrap() {
-            Destination::Finished(p) => {
-                format!("done {}", p.file_name().unwrap().to_string_lossy())
-            }
-            Destination::Write(p) => format!("write {}", p.file_name().unwrap().to_string_lossy()),
+            Picked::Finished(p) => format!("done {}", p.file_name().unwrap().to_string_lossy()),
+            Picked::Write(c) => format!("write {}", c.0.file_name().unwrap().to_string_lossy()),
         };
         assert_eq!(pick(10), "write x.mkv");
         std::fs::write(&dest, [0u8; 10]).unwrap();
         assert_eq!(pick(10), "done x.mkv");
         assert_eq!(pick(20), "write x (2).mkv");
-        std::fs::write(dir.join("x (2).mkv"), [0u8; 20]).unwrap();
+        std::fs::write(dir.path().join("x (2).mkv"), [0u8; 20]).unwrap();
         assert_eq!(pick(20), "done x (2).mkv");
-        // A partial download of ours is resumed, not skipped.
-        std::fs::write(dir.join("x.mkv.rdpart"), b"{}").unwrap();
-        assert_eq!(pick(10), "write x.mkv");
-        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Our partial download (same size) is resumed; someone else's
+        // (another size) is left alone.
+        Sidecar {
+            total_size: 30,
+            completed_ranges: vec![],
+        }
+        .save(&dir.path().join("y.mkv"))
+        .unwrap();
+        let ydest = dir.path().join("y.mkv");
+        let picked = |total| match pick_destination(&ydest, Some(total)).unwrap() {
+            Picked::Finished(p) => format!("done {}", p.file_name().unwrap().to_string_lossy()),
+            Picked::Write(c) => format!("write {}", c.0.file_name().unwrap().to_string_lossy()),
+        };
+        assert_eq!(picked(30), "write y.mkv");
+        assert_eq!(picked(40), "write y (2).mkv");
+    }
+
+    #[test]
+    fn concurrent_downloads_never_share_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("z.bin");
+        let first = match pick_destination(&dest, Some(5)).unwrap() {
+            Picked::Write(c) => c,
+            Picked::Finished(_) => panic!(),
+        };
+        let second = match pick_destination(&dest, Some(5)).unwrap() {
+            Picked::Write(c) => c,
+            Picked::Finished(_) => panic!(),
+        };
+        assert_ne!(first.0, second.0);
+        drop(first);
+        // Released paths can be picked again.
+        match pick_destination(&dest, Some(5)).unwrap() {
+            Picked::Write(c) => assert_eq!(c.0, dest),
+            Picked::Finished(_) => panic!(),
+        }
+    }
+
+    #[test]
+    fn long_names_are_shortened_keeping_the_extension() {
+        let long = format!("{}.mkv", "é".repeat(150)); // 300 bytes
+        let short = safe_filename(&long);
+        assert!(short.len() <= MAX_NAME_BYTES, "{}", short.len());
+        assert!(short.ends_with(".mkv"));
+        assert_eq!(safe_filename("short.mkv"), "short.mkv");
+    }
+
+    #[test]
+    fn unique_names_and_connection_caps() {
+        let mut claimed = HashSet::new();
+        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x.mkv");
+        assert_eq!(unique_name(&mut claimed, "x.mkv"), "x (2).mkv");
+        assert_eq!(unique_name(&mut claimed, "X.MKV"), "X (3).MKV");
+        assert_eq!(unique_name(&mut claimed, "README"), "README");
+        assert_eq!(unique_name(&mut claimed, "README"), "README (2)");
+        assert_eq!(cap_connections(8, 4), 4);
+        assert_eq!(cap_connections(8, 0), 8);
+        assert_eq!(cap_connections(0, 16), 1);
     }
 
     #[test]
@@ -1061,14 +1249,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let dir = std::env::temp_dir().join(format!("rd-dl-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir = tmpdir.path().to_path_buf();
         let dest = dir.join("out.bin");
 
         // Pretend a previous run (with a different URL) finished the first chunk.
         std::fs::write(&dest, &data[..CHUNK_SIZE as usize]).unwrap();
         Sidecar {
-            url: "https://old.example/expired".into(),
             total_size: total as u64,
             completed_ranges: vec![(0, CHUNK_SIZE - 1)],
         }
@@ -1079,7 +1266,7 @@ mod tests {
             concurrency: 3,
             quiet: true,
         };
-        fetch(&format!("{}/new", server.uri()), &dest, opts)
+        fetch(&format!("{}/new", server.uri()), "out.bin", &dest, opts)
             .await
             .unwrap();
 

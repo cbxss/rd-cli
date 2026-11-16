@@ -31,8 +31,9 @@ rd auth login
 rd auth whoami
 ```
 
-Your token is stored at `~/.config/rd/config.toml` with `0600` permissions on
-Unix systems.
+Your token is stored in `config.toml` in your user config directory
+(`~/.config/rd` on Linux, `~/Library/Application Support/rd` on macOS,
+`%APPDATA%\rd\config` on Windows), readable only by you on Unix.
 
 ## Usage
 

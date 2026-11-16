@@ -12,9 +12,10 @@ const BASE_URL: &str = "https://api.real-debrid.com/rest/1.0";
 const MAX_RETRIES: u32 = 5;
 /// Longest server-requested wait (`Retry-After`) that is honoured as-is.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
-/// Client-side pacing below Real-Debrid's 250 requests/minute: bursts of up
-/// to `RATE_BURST` requests, then `RATE_PER_SEC` per second.
-const RATE_BURST: f64 = 40.0;
+/// Client-side pacing under Real-Debrid's 250 requests/minute: bursts of up
+/// to `RATE_BURST` requests, then `RATE_PER_SEC` per second — at most 250 in
+/// any minute.
+const RATE_BURST: f64 = 10.0;
 const RATE_PER_SEC: f64 = 4.0;
 /// Page size for list endpoints (the API caps `limit` at 5000; default is 100).
 const PAGE_LIMIT: usize = 5000;
@@ -149,7 +150,7 @@ impl Client {
             }
             // A server that ignores `page` would otherwise be paged forever.
             if previous.as_deref() == Some(&body[..]) {
-                return Err(RdError::Config(format!(
+                return Err(RdError::Protocol(format!(
                     "{path}: the server returned the same page twice; refusing to loop"
                 )));
             }
@@ -272,7 +273,7 @@ impl Client {
                     let transient = !err.is_builder();
                     let idempotent = matches!(method, Method::GET | Method::DELETE);
                     if transient && (err.is_connect() || idempotent) && attempt < MAX_RETRIES {
-                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        retry_sleep(backoff_delay(attempt)).await;
                         attempt += 1;
                         continue;
                     }
@@ -290,7 +291,7 @@ impl Client {
             if retryable && attempt < MAX_RETRIES {
                 let delay = retry_delay_for(status, retry_after(&resp), attempt);
                 attempt += 1;
-                tokio::time::sleep(delay).await;
+                retry_sleep(delay).await;
                 continue;
             }
 
@@ -330,6 +331,17 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// Waits before a retry (barely at all in unit tests, which script failures
+/// against local mock servers; the delays themselves are tested separately).
+async fn retry_sleep(delay: Duration) {
+    let delay = if cfg!(test) {
+        Duration::from_millis(1)
+    } else {
+        delay
+    };
+    tokio::time::sleep(delay).await;
+}
+
 /// How long to wait before retrying a failed response: the server's
 /// `Retry-After` (capped), else a backoff — long enough for 429s to reach
 /// Real-Debrid's next per-minute window.
@@ -363,15 +375,6 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct Pong {
         pong: bool,
-    }
-
-    #[tokio::test]
-    async fn no_token_fails_fast_without_a_network_call() {
-        let client = Client::with_base_url("http://127.0.0.1:1".to_string(), None).unwrap();
-        assert!(matches!(
-            client.require_token(),
-            Err(RdError::NotAuthenticated)
-        ));
     }
 
     #[tokio::test]

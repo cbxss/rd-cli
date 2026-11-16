@@ -25,6 +25,9 @@ pub async fn login() -> Result<()> {
     config.save()?;
 
     println!("Logged in as {} ({})", user.username, user.email);
+    if std::env::var("RD_TOKEN").is_ok_and(|t| !t.trim().is_empty()) {
+        println!("Note: RD_TOKEN is set and takes precedence over the saved token.");
+    }
     Ok(())
 }
 
@@ -34,6 +37,9 @@ pub fn logout() -> Result<()> {
     } else {
         println!("Not logged in.");
     }
+    if std::env::var("RD_TOKEN").is_ok_and(|t| !t.trim().is_empty()) {
+        println!("Note: RD_TOKEN is still set, so commands keep using that token.");
+    }
     Ok(())
 }
 
@@ -42,7 +48,7 @@ pub async fn whoami(json: bool) -> Result<()> {
     let user: User = client.get_json("/user").await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&user)?);
+        crate::output::print_json(&user)?;
     } else {
         println!("Username:    {}", user.username);
         println!("Email:       {}", user.email);

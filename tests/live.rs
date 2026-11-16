@@ -99,16 +99,30 @@ fn hash_of(magnet: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Deletes the torrent on drop (also when an assertion fails).
+/// On drop (also when an assertion fails), deletes every torrent with the
+/// test's hash that wasn't on the account before the test started.
 struct Cleanup<'a> {
     dir: &'a Path,
-    id: Option<String>,
+    hash: String,
+    before: Vec<String>,
 }
 
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
-        if let Some(id) = &self.id {
-            rd(self.dir, &["torrents", "delete", id]);
+        let Ok(list) = std::panic::catch_unwind(|| torrents_with_hash(self.dir, &self.hash)) else {
+            eprintln!(
+                "cleanup: couldn't list torrents; check `rd torrents list` for {}",
+                self.hash
+            );
+            return;
+        };
+        for t in list {
+            if let Some(id) = t["id"]
+                .as_str()
+                .filter(|id| !self.before.iter().any(|b| b == id))
+            {
+                rd(self.dir, &["torrents", "delete", id]);
+            }
         }
     }
 }
@@ -146,10 +160,14 @@ fn live_download_round_trip() {
     let magnet = std::env::var("RD_LIVE_MAGNET").unwrap_or_else(|_| DEFAULT_MAGNET.to_string());
     let hash = hash_of(&magnet);
     let dir = tempfile::tempdir().unwrap();
-    let pre_existing = !torrents_with_hash(dir.path(), &hash).is_empty();
-    let mut cleanup = Cleanup {
+    let before: Vec<String> = torrents_with_hash(dir.path(), &hash)
+        .iter()
+        .filter_map(|t| t["id"].as_str().map(String::from))
+        .collect();
+    let _cleanup = Cleanup {
         dir: dir.path(),
-        id: None,
+        hash: hash.clone(),
+        before,
     };
 
     // 1. Parallel download (-j 3) of every file.
@@ -167,12 +185,6 @@ fn live_download_round_trip() {
         ],
     );
     let found = torrents_with_hash(dir.path(), &hash);
-    if !pre_existing {
-        cleanup.id = found
-            .first()
-            .and_then(|t| t["id"].as_str())
-            .map(String::from);
-    }
     assert!(out.ok, "{}", out.stderr);
     assert!(
         !out.stdout.contains("retrying"),
@@ -216,7 +228,7 @@ fn live_download_round_trip() {
     let out = rd(dir.path(), &["dl", &magnet, "-o", "one"]);
     assert!(out.ok, "{}", out.stderr);
     assert!(
-        out.stdout.contains("Reusing existing torrent"),
+        out.stdout.contains("reusing existing torrent"),
         "{}",
         out.stdout
     );

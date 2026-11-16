@@ -12,21 +12,20 @@ mod support;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use support::{Fake, TOKEN, TorrentSpec, data};
+use support::{
+    AMBIENT_ENV, Fake, HASH, MIB, Out, TOKEN, TorrentSpec, assert_file, completed_bytes, data,
+};
 use testcontainers::core::{ExecCommand, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 
-const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
-const MIB: usize = 1024 * 1024;
-
 fn magnet() -> String {
-    format!("magnet:?xt=urn:btih:{HASH}&dn=test")
+    support::magnet(HASH)
 }
 
 fn unique(prefix: &str) -> String {
@@ -262,43 +261,23 @@ fn wait_http(url: &str) {
     }
 }
 
-struct Out {
-    ok: bool,
-    stdout: String,
-    stderr: String,
-}
-
-/// Runs the host `rd` binary against `fake`, with extra environment.
+/// Runs the host `rd` binary against `fake`, with extra environment. Killed
+/// (failing the test) if it runs for more than three minutes.
 fn rd(fake: &Fake, dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rd"));
+    for var in AMBIENT_ENV {
+        cmd.env_remove(var);
+    }
     cmd.args(args)
         .current_dir(dir)
         .env("RD_API_URL", fake.url())
         .env("RD_TOKEN", TOKEN)
         .env("RD_CONFIG_DIR", dir.join("config"))
-        .env("RD_POLL_MS", "10")
-        .env_remove("RD_CA_CERT")
-        .stdin(Stdio::null());
+        .env("RD_POLL_MS", "10");
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.output().unwrap();
-    let out = Out {
-        ok: out.status.success(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    };
-    eprintln!("--- rd {args:?}\n{}{}", out.stdout, out.stderr);
-    out
-}
-
-fn assert_file(path: &Path, expected: &[u8]) {
-    let got = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    assert!(
-        got.len() == expected.len() && got == expected,
-        "{} differs",
-        path.display()
-    );
+    support::run(cmd, Duration::from_secs(180))
 }
 
 fn torrent(files: &[(&str, Arc<Vec<u8>>)]) -> TorrentSpec {
@@ -392,20 +371,6 @@ fn connections_cut_mid_chunk_resume_where_they_stopped() {
     );
     assert!(out.ok, "{}", out.stderr);
     assert_file(&dir.path().join("out/cut.bin"), &big);
-}
-
-#[derive(serde::Deserialize)]
-struct Sidecar {
-    completed_ranges: Vec<(u64, u64)>,
-}
-
-fn completed_bytes(sidecar: &Path) -> u64 {
-    std::fs::read(sidecar)
-        .ok()
-        .and_then(|d| serde_json::from_slice::<Sidecar>(&d).ok())
-        .map_or(0, |s| {
-            s.completed_ranges.iter().map(|(a, b)| b - a + 1).sum()
-        })
 }
 
 #[test]
