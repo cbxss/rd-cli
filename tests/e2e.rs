@@ -3,7 +3,6 @@
 
 mod support;
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -753,6 +752,8 @@ fn torrents_select_on_a_finished_torrent_downloads_nothing() {
 #[cfg(unix)]
 #[test]
 fn closed_stdout_exits_quietly() {
+    use std::io::Read;
+
     let env = Env::new();
     env.fake.add_filler_torrents(3000); // far more output than a pipe buffer
     let mut child = KillOnDrop(env.spawn(&["torrents", "list", "--json"]));
