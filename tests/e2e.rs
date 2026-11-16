@@ -3,30 +3,29 @@
 
 mod support;
 
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use support::{Fake, TOKEN, TorrentSpec, data, step};
-
-const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
-const MIB: usize = 1024 * 1024;
-
-fn magnet(hash: &str) -> String {
-    format!("magnet:?xt=urn:btih:{hash}&dn=test")
-}
+use support::{
+    AMBIENT_ENV, Fake, HASH, MIB, Out, TOKEN, TorrentSpec, assert_file, completed_ranges, data,
+    magnet, step,
+};
 
 struct Env {
     fake: Fake,
     dir: tempfile::TempDir,
 }
 
-struct Out {
-    ok: bool,
-    stdout: String,
-    stderr: String,
+/// Kills the child process if a test fails while it's still running.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 impl Env {
@@ -43,65 +42,30 @@ impl Env {
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_rd"));
+        for var in AMBIENT_ENV {
+            c.env_remove(var);
+        }
         c.args(args)
             .current_dir(self.dir.path())
             .env("RD_API_URL", self.fake.url())
             .env("RD_TOKEN", TOKEN)
             .env("RD_CONFIG_DIR", self.dir.path().join("config"))
-            .env("RD_POLL_MS", "10")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .env("RD_POLL_MS", "10");
         c
     }
 
     fn spawn(&self, args: &[&str]) -> Child {
-        self.cmd(args).spawn().unwrap()
+        self.cmd(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
     }
 
-    /// Runs `rd` to completion (killing it after 120 s so a hang fails the test).
     fn run(&self, args: &[&str]) -> Out {
-        let mut child = self.spawn(args);
-        let mut so = child.stdout.take().unwrap();
-        let mut se = child.stderr.take().unwrap();
-        let t1 = std::thread::spawn(move || {
-            let mut s = String::new();
-            so.read_to_string(&mut s).unwrap();
-            s
-        });
-        let t2 = std::thread::spawn(move || {
-            let mut s = String::new();
-            se.read_to_string(&mut s).unwrap();
-            s
-        });
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let status = loop {
-            if let Some(st) = child.try_wait().unwrap() {
-                break st;
-            }
-            if Instant::now() > deadline {
-                child.kill().unwrap();
-                panic!("rd {args:?} timed out");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let out = Out {
-            ok: status.success(),
-            stdout: t1.join().unwrap(),
-            stderr: t2.join().unwrap(),
-        };
-        eprintln!("--- rd {args:?}\n{}{}", out.stdout, out.stderr);
-        out
+        support::run(self.cmd(args), Duration::from_secs(120))
     }
-}
-
-fn assert_file(path: &Path, expected: &[u8]) {
-    let got = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    assert!(
-        got.len() == expected.len() && got == expected,
-        "{} differs",
-        path.display()
-    );
 }
 
 #[test]
@@ -156,12 +120,12 @@ fn rerun_reuses_torrent_and_skips_finished_files() {
         .on_magnet(TorrentSpec::new(HASH, vec![("a.bin", a.clone())]));
 
     assert!(env.run(&["dl", &magnet(HASH), "-o", "out"]).ok);
-    env.fake.take_ranges();
+    env.fake.take_file_gets();
 
     let out = env.run(&["dl", &magnet(HASH), "-o", "out"]);
     assert!(out.ok, "{}", out.stderr);
     assert!(
-        out.stdout.contains("Reusing existing torrent"),
+        out.stdout.contains("reusing existing torrent"),
         "{}",
         out.stdout
     );
@@ -171,8 +135,9 @@ fn rerun_reuses_torrent_and_skips_finished_files() {
         1,
         "the magnet must not be added twice"
     );
-    assert!(
-        env.fake.take_ranges().is_empty(),
+    assert_eq!(
+        env.fake.take_file_gets(),
+        0,
         "no file data should be refetched"
     );
     assert_file(&env.out_dir().join("a.bin"), &a);
@@ -193,7 +158,7 @@ fn copy_with_partial_selection_is_not_reused() {
 
     let out = env.run(&["dl", &magnet(HASH), "-o", "out"]);
     assert!(out.ok, "{}", out.stderr);
-    assert!(out.stdout.contains("Added torrent"), "{}", out.stdout);
+    assert!(out.stdout.contains("added torrent"), "{}", out.stdout);
     assert_file(&env.out_dir().join("b.bin"), &b);
 }
 
@@ -314,29 +279,22 @@ fn torrents_add_select_waits_for_conversion() {
     let out = env.run(&["torrents", "add", &magnet(HASH), "--select", "all"]);
     assert!(out.ok, "{}", out.stderr);
     assert_eq!(env.fake.premature_selects(), 0);
+    assert_eq!(env.fake.select_count(), 1, "the selection was never made");
 }
 
 #[test]
-fn server_ignoring_ranges_fails_cleanly() {
+fn server_ignoring_ranges_falls_back_to_one_stream() {
     let env = Env::new();
-    env.fake.on_magnet(TorrentSpec::new(
-        HASH,
-        vec![("big.bin", data(60 * MIB, 14))],
-    ));
+    let big = data(60 * MIB, 14);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("big.bin", big.clone())]));
     env.fake.faults(|f| f.ignore_ranges = true);
 
-    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q"]);
-    assert!(!out.ok);
-    assert!(
-        out.stderr.contains("ignored the range request"),
-        "{}",
-        out.stderr
-    );
-}
-
-#[derive(serde::Deserialize)]
-struct Sidecar {
-    completed_ranges: Vec<(u64, u64)>,
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert!(out.stdout.contains("in one stream"), "{}", out.stdout);
+    assert_file(&env.out_dir().join("big.bin"), &big);
+    assert!(!env.out_dir().join("big.bin.rdpart").exists());
 }
 
 #[test]
@@ -349,26 +307,23 @@ fn interrupted_download_resumes_where_it_stopped() {
 
     let dest = env.out_dir().join("big.bin");
     let sidecar_path = env.out_dir().join("big.bin.rdpart");
-    let mut child = env.spawn(&["dl", &magnet(HASH), "-o", "out", "-q"]);
+    let mut child = KillOnDrop(env.spawn(&["dl", &magnet(HASH), "-o", "out", "-q"]));
 
     // Wait until at least one chunk is recorded as finished, then kill -9.
     let deadline = Instant::now() + Duration::from_secs(60);
     let done = loop {
-        let sc = std::fs::read(&sidecar_path)
-            .ok()
-            .and_then(|d| serde_json::from_slice::<Sidecar>(&d).ok());
-        if let Some(sc) = sc.filter(|s| !s.completed_ranges.is_empty()) {
-            break sc.completed_ranges;
+        let done = completed_ranges(&sidecar_path);
+        if !done.is_empty() {
+            break done;
         }
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.0.try_wait().unwrap().is_none(),
             "rd exited before it was interrupted"
         );
         assert!(Instant::now() < deadline, "no chunk finished in time");
         std::thread::sleep(Duration::from_millis(10));
     };
-    child.kill().unwrap();
-    child.wait().unwrap();
+    drop(child);
     let done_bytes: u64 = done.iter().map(|(s, e)| e - s + 1).sum();
     assert!(
         done_bytes < big.len() as u64,
@@ -446,14 +401,13 @@ fn interrupted_small_download_leaves_no_truncated_file() {
 
     let dest = env.out_dir().join("a.bin");
     let tmp = env.out_dir().join("a.bin.rdtmp");
-    let mut child = env.spawn(&["dl", &magnet(HASH), "-o", "out", "-q"]);
+    let child = KillOnDrop(env.spawn(&["dl", &magnet(HASH), "-o", "out", "-q"]));
     let deadline = Instant::now() + Duration::from_secs(30);
     while std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) == 0 {
         assert!(Instant::now() < deadline, "download never started");
         std::thread::sleep(Duration::from_millis(10));
     }
-    child.kill().unwrap();
-    child.wait().unwrap();
+    drop(child);
     assert!(
         !dest.exists(),
         "a partial file must not appear under the real name"
@@ -483,6 +437,11 @@ fn unrestrict_json_keeps_stdout_machine_readable() {
         serde_json::from_str(&out.stdout).expect("stdout is one JSON document");
     assert_eq!(v["filename"], "a.bin");
     assert_file(&env.out_dir().join("a.bin"), &a);
+
+    // A rerun ("already downloaded") must not add text to the JSON either.
+    let out = env.run(&["unrestrict", &link, "--json", "-o", "out"]);
+    assert!(out.ok, "{}", out.stderr);
+    serde_json::from_str::<serde_json::Value>(&out.stdout).expect("stdout is one JSON document");
 }
 
 #[test]
@@ -531,6 +490,289 @@ fn files_refused_in_parallel_are_retried_one_at_a_time() {
     assert_eq!(
         std::fs::read_dir(env.out_dir()).unwrap().count(),
         files.len()
+    );
+}
+
+#[test]
+fn big_file_with_one_connection_still_uses_resumable_chunks() {
+    let env = Env::new();
+    let big = data(60 * MIB, 50);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("big.bin", big.clone())]));
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q", "--concurrency", "1"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_file(&env.out_dir().join("big.bin"), &big);
+    assert!(
+        !env.fake.take_ranges().is_empty(),
+        "downloaded without ranges (not resumable)"
+    );
+}
+
+#[test]
+fn an_unrelated_file_with_the_same_name_is_never_overwritten() {
+    let env = Env::new();
+    let a = data(3000, 51);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("a.bin", a.clone())]));
+    std::fs::create_dir_all(env.out_dir()).unwrap();
+    std::fs::write(env.out_dir().join("a.bin"), b"someone else's file").unwrap();
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert!(out.stdout.contains("saving as"), "{}", out.stdout);
+    assert_eq!(
+        std::fs::read(env.out_dir().join("a.bin")).unwrap(),
+        b"someone else's file"
+    );
+    assert_file(&env.out_dir().join("a (2).bin"), &a);
+
+    // A rerun recognises the numbered copy as already downloaded.
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out"]);
+    assert!(out.ok, "{}", out.stderr);
+    let recognised = format!(
+        "already downloaded: {}",
+        std::path::Path::new("out").join("a (2).bin").display()
+    );
+    assert!(out.stdout.contains(&recognised), "{}", out.stdout);
+    assert_eq!(std::fs::read_dir(env.out_dir()).unwrap().count(), 2);
+}
+
+#[test]
+fn leftover_resume_file_is_cleared_by_a_successful_download() {
+    // What an older failed chunked attempt leaves behind: a full-size
+    // preallocated file and a sidecar for the same size, nothing finished.
+    let env = Env::new();
+    let a = data(3000, 52);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("a.bin", a.clone())]));
+    std::fs::create_dir_all(env.out_dir()).unwrap();
+    std::fs::write(env.out_dir().join("a.bin"), vec![0u8; a.len()]).unwrap();
+    std::fs::write(
+        env.out_dir().join("a.bin.rdpart"),
+        br#"{"total_size":3000,"completed_ranges":[]}"#,
+    )
+    .unwrap();
+
+    assert!(env.run(&["dl", &magnet(HASH), "-o", "out", "-q"]).ok);
+    assert_file(&env.out_dir().join("a.bin"), &a);
+    assert!(!env.out_dir().join("a.bin.rdpart").exists());
+    env.fake.take_file_gets();
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out"]);
+    assert!(out.stdout.contains("already downloaded"), "{}", out.stdout);
+    assert_eq!(env.fake.take_file_gets(), 0);
+}
+
+#[test]
+fn someone_elses_partial_download_is_left_alone() {
+    let env = Env::new();
+    let a = data(3000, 57);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("a.bin", a.clone())]));
+    std::fs::create_dir_all(env.out_dir()).unwrap();
+    let theirs = br#"{"total_size":999999,"completed_ranges":[[0,65535]]}"#;
+    std::fs::write(env.out_dir().join("a.bin"), b"partial data of another file").unwrap();
+    std::fs::write(env.out_dir().join("a.bin.rdpart"), theirs).unwrap();
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_file(&env.out_dir().join("a (2).bin"), &a);
+    assert_eq!(
+        std::fs::read(env.out_dir().join("a.bin")).unwrap(),
+        b"partial data of another file"
+    );
+    assert_eq!(
+        std::fs::read(env.out_dir().join("a.bin.rdpart")).unwrap(),
+        theirs
+    );
+}
+
+#[test]
+fn same_names_and_an_unrelated_file_never_share_a_path() {
+    // The case that used to corrupt a file: two torrent files called x.bin
+    // plus an unrelated x.bin already in the output folder, all large
+    // enough for the chunked path, downloaded in parallel.
+    let env = Env::new();
+    let (a, b) = (data(52 * MIB, 58), data(53 * MIB, 59));
+    env.fake.on_magnet(TorrentSpec::new(
+        HASH,
+        vec![("S1/x.bin", a.clone()), ("S2/x.bin", b.clone())],
+    ));
+    std::fs::create_dir_all(env.out_dir()).unwrap();
+    std::fs::write(env.out_dir().join("x.bin"), b"unrelated").unwrap();
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q", "-j", "2"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(
+        std::fs::read(env.out_dir().join("x.bin")).unwrap(),
+        b"unrelated"
+    );
+    let mut found = (false, false);
+    for entry in std::fs::read_dir(env.out_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        let got = std::fs::read(&path).unwrap();
+        found.0 |= got == a.as_slice();
+        found.1 |= got == b.as_slice();
+        assert!(
+            !path.to_string_lossy().ends_with(".rdpart"),
+            "leftover {}",
+            path.display()
+        );
+    }
+    assert_eq!(found, (true, true), "both files must be intact");
+}
+
+#[test]
+fn very_long_names_are_shortened() {
+    let env = Env::new();
+    let a = data(100, 60);
+    let long = format!("{}.mkv", "n".repeat(250));
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![(long.as_str(), a.clone())]));
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q"]);
+    assert!(out.ok, "{}", out.stderr);
+    let names: Vec<String> = std::fs::read_dir(env.out_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1);
+    assert!(
+        names[0].len() <= 200 && names[0].ends_with(".mkv"),
+        "{names:?}"
+    );
+    assert_file(&env.out_dir().join(&names[0]), &a);
+}
+
+#[test]
+fn connections_cut_mid_chunk_resume_where_they_stopped() {
+    // Every response stops after 8 MiB; a 64 MiB chunk only completes if each
+    // retry continues from where the previous one was cut off.
+    let env = Env::new();
+    let big = data(70 * MIB, 61);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("big.bin", big.clone())]));
+    env.fake
+        .faults(|f| f.cut_bodies_after = Some(8 * MIB as u64));
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_file(&env.out_dir().join("big.bin"), &big);
+}
+
+#[test]
+fn transient_probe_and_rate_limit_failures_are_retried() {
+    let env = Env::new();
+    let big = data(60 * MIB, 62);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("big.bin", big.clone())]));
+    env.fake.faults(|f| {
+        f.fail_probes = 2;
+        f.fail_next_ranges = Some((429, 2));
+    });
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q", "-j", "1"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert!(
+        !out.stdout.contains("retrying"),
+        "should not need a second pass: {}",
+        out.stdout
+    );
+    assert_file(&env.out_dir().join("big.bin"), &big);
+}
+
+#[test]
+fn bulk_unrestrict_names_json_and_output_file() {
+    let env = Env::new();
+    // Same size, different content: only the in-batch name check keeps the
+    // second from being taken for an already-downloaded copy of the first.
+    let (a, b) = (data(100, 53), data(100, 54));
+    let t1 = env.fake.add_torrent(
+        TorrentSpec::new(HASH, vec![("x/same.bin", a.clone())])
+            .initial(step("downloaded", 100.0))
+            .script(vec![])
+            .selected(vec![true]),
+    );
+    let t2 = env.fake.add_torrent(
+        TorrentSpec::new(
+            "ffffffffffffffffffffffffffffffffffffffff",
+            vec![("y/same.bin", b.clone())],
+        )
+        .initial(step("downloaded", 100.0))
+        .script(vec![])
+        .selected(vec![true]),
+    );
+    let base = env.fake.url();
+    let list = env.dir.path().join("links.txt");
+    std::fs::write(
+        &list,
+        format!("{base}/hoster/{t1}/1\n{base}/hoster/{t2}/1\n"),
+    )
+    .unwrap();
+
+    let out = env.run(&["unrestrict", "links.txt", "-o", "out", "-q"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_file(&env.out_dir().join("same.bin"), &a);
+    assert_file(&env.out_dir().join("same (2).bin"), &b);
+
+    // A links file prints an array, even with a single link in it.
+    std::fs::write(&list, format!("{base}/hoster/{t1}/1\n")).unwrap();
+    let out = env.run(&["unrestrict", "links.txt", "--json", "-t"]);
+    assert!(out.ok, "{}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert!(v.is_array(), "{v}");
+
+    let out = env.run(&["unrestrict", "links.txt", "-O", "named.bin"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("only works with a single link"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn torrents_select_on_a_finished_torrent_downloads_nothing() {
+    let env = Env::new();
+    let tid = env.fake.add_torrent(
+        TorrentSpec::new(
+            HASH,
+            vec![("a.bin", data(100, 55)), ("b.bin", data(100, 56))],
+        )
+        .initial(step("downloaded", 100.0))
+        .script(vec![])
+        .selected(vec![true, true]),
+    );
+    let out = env.run(&["torrents", "select", &tid, "1"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert!(
+        out.stdout.contains(&format!("rd dl {tid}")),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(env.fake.take_file_gets(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_exits_quietly() {
+    use std::io::Read;
+
+    let env = Env::new();
+    env.fake.add_filler_torrents(3000); // far more output than a pipe buffer
+    let mut child = KillOnDrop(env.spawn(&["torrents", "list", "--json"]));
+    drop(child.0.stdout.take()); // like `| head` exiting
+    let status = child.0.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        status.signal(),
+        Some(13),
+        "expected SIGPIPE, got {status:?}"
     );
 }
 

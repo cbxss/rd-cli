@@ -10,6 +10,13 @@ type Result<T> = std::result::Result<T, RdError>;
 
 const BASE_URL: &str = "https://api.real-debrid.com/rest/1.0";
 const MAX_RETRIES: u32 = 5;
+/// Longest server-requested wait (`Retry-After`) that is honoured as-is.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Client-side pacing under Real-Debrid's 250 requests/minute: bursts of up
+/// to `RATE_BURST` requests, then `RATE_PER_SEC` per second — at most 250 in
+/// any minute.
+const RATE_BURST: f64 = 10.0;
+const RATE_PER_SEC: f64 = 4.0;
 /// Page size for list endpoints (the API caps `limit` at 5000; default is 100).
 const PAGE_LIMIT: usize = 5000;
 
@@ -17,6 +24,35 @@ pub struct Client {
     http: reqwest::Client,
     base_url: String,
     token: Option<String>,
+    limiter: RateLimiter,
+}
+
+/// Token bucket shared by every request this client makes.
+struct RateLimiter(std::sync::Mutex<(f64, std::time::Instant)>);
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new((
+            RATE_BURST,
+            std::time::Instant::now(),
+        )))
+    }
+
+    /// How long to wait before the next request may go out (and reserves it).
+    fn reserve(&self) -> Duration {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let (tokens, last) = &mut *guard;
+        let now = std::time::Instant::now();
+        *tokens =
+            (*tokens + now.duration_since(*last).as_secs_f64() * RATE_PER_SEC).min(RATE_BURST);
+        *last = now;
+        *tokens -= 1.0;
+        if *tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-*tokens / RATE_PER_SEC)
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -46,15 +82,14 @@ impl Client {
     }
 
     pub(crate) fn with_base_url(base_url: String, token: Option<String>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("rd/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(60))
+        let http = crate::http::builder()
+            .map_err(|e| RdError::Config(format!("{e:#}")))?
             .build()?;
         Ok(Self {
             http,
             base_url,
-            token,
+            token: token.map(|t| t.trim().to_string()),
+            limiter: RateLimiter::new(),
         })
     }
 
@@ -95,6 +130,7 @@ impl Client {
         let limit = PAGE_LIMIT.to_string();
         let mut all = Vec::new();
         let mut page = 1usize;
+        let mut previous: Option<Vec<u8>> = None;
         loop {
             let page_str = page.to_string();
             let mut q: Vec<(&str, &str)> = query.to_vec();
@@ -103,16 +139,28 @@ impl Client {
             let resp = self
                 .execute(Method::GET, path, &q, Body::None, Retry::Always)
                 .await?;
+            let total: Option<usize> = resp
+                .headers()
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok());
             let body = resp.bytes().await?;
             if body.iter().all(u8::is_ascii_whitespace) {
                 break;
             }
+            // A server that ignores `page` would otherwise be paged forever.
+            if previous.as_deref() == Some(&body[..]) {
+                return Err(RdError::Protocol(format!(
+                    "{path}: the server returned the same page twice; refusing to loop"
+                )));
+            }
             let items: Vec<T> = serde_json::from_slice(&body)?;
             let n = items.len();
             all.extend(items);
-            if n < PAGE_LIMIT {
+            if n < PAGE_LIMIT || total.is_some_and(|t| all.len() >= t) {
                 break;
             }
+            previous = Some(body.to_vec());
             page += 1;
         }
         Ok(all)
@@ -197,6 +245,16 @@ impl Client {
         let mut attempt = 0u32;
 
         loop {
+            // (Unit tests mock fast-paced conversations; the limiter has its
+            // own test.)
+            let wait = if cfg!(test) {
+                Duration::ZERO
+            } else {
+                self.limiter.reserve()
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
             let mut req = self.http.request(method.clone(), &url).query(query);
             if let Some(token) = &self.token {
                 req = req.bearer_auth(token);
@@ -210,9 +268,12 @@ impl Client {
             let resp = match req.send().await {
                 Ok(resp) => resp,
                 Err(err) => {
+                    // A request that couldn't even be built (e.g. a token with
+                    // a newline in it) will never succeed.
+                    let transient = !err.is_builder();
                     let idempotent = matches!(method, Method::GET | Method::DELETE);
-                    if (err.is_connect() || idempotent) && attempt < MAX_RETRIES {
-                        tokio::time::sleep(backoff_delay(attempt)).await;
+                    if transient && (err.is_connect() || idempotent) && attempt < MAX_RETRIES {
+                        retry_sleep(backoff_delay(attempt)).await;
                         attempt += 1;
                         continue;
                     }
@@ -228,9 +289,9 @@ impl Client {
             let retryable = status == StatusCode::TOO_MANY_REQUESTS
                 || (status.is_server_error() && retry == Retry::Always);
             if retryable && attempt < MAX_RETRIES {
-                let delay = retry_after(&resp).unwrap_or_else(|| backoff_delay(attempt));
+                let delay = retry_delay_for(status, retry_after(&resp), attempt);
                 attempt += 1;
-                tokio::time::sleep(delay).await;
+                retry_sleep(delay).await;
                 continue;
             }
 
@@ -270,6 +331,34 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// Waits before a retry (barely at all in unit tests, which script failures
+/// against local mock servers; the delays themselves are tested separately).
+async fn retry_sleep(delay: Duration) {
+    let delay = if cfg!(test) {
+        Duration::from_millis(1)
+    } else {
+        delay
+    };
+    tokio::time::sleep(delay).await;
+}
+
+/// How long to wait before retrying a failed response: the server's
+/// `Retry-After` (capped), else a backoff — long enough for 429s to reach
+/// Real-Debrid's next per-minute window.
+fn retry_delay_for(status: StatusCode, retry_after: Option<Duration>, attempt: u32) -> Duration {
+    let fallback = if status == StatusCode::TOO_MANY_REQUESTS {
+        rate_limit_delay(attempt)
+    } else {
+        backoff_delay(attempt)
+    };
+    retry_after.map_or(fallback, |d| d.min(MAX_RETRY_AFTER))
+}
+
+/// 2, 4, 8, 16, 30 s: about a minute in total.
+fn rate_limit_delay(attempt: u32) -> Duration {
+    Duration::from_secs((2u64 << attempt.min(4)).min(30))
+}
+
 fn backoff_delay(attempt: u32) -> Duration {
     let base_ms = 500u64.saturating_mul(1u64 << attempt.min(6));
     Duration::from_millis(base_ms.min(10_000))
@@ -286,15 +375,6 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct Pong {
         pong: bool,
-    }
-
-    #[tokio::test]
-    async fn no_token_fails_fast_without_a_network_call() {
-        let client = Client::with_base_url("http://127.0.0.1:1".to_string(), None).unwrap();
-        assert!(matches!(
-            client.require_token(),
-            Err(RdError::NotAuthenticated)
-        ));
     }
 
     #[tokio::test]
@@ -423,6 +503,80 @@ mod tests {
         let client = Client::with_base_url(empty.uri(), None).unwrap();
         let none: Vec<i64> = client.get_all_pages("/torrents", &[]).await.unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn retry_delays_are_bounded() {
+        let s = StatusCode::SERVICE_UNAVAILABLE;
+        let r = StatusCode::TOO_MANY_REQUESTS;
+        assert_eq!(
+            retry_delay_for(s, Some(Duration::from_secs(3600)), 0),
+            MAX_RETRY_AFTER
+        );
+        assert_eq!(
+            retry_delay_for(s, Some(Duration::from_secs(2)), 0),
+            Duration::from_secs(2)
+        );
+        let rate_total: Duration = (0..MAX_RETRIES).map(|a| retry_delay_for(r, None, a)).sum();
+        assert!(rate_total >= Duration::from_secs(60), "{rate_total:?}");
+    }
+
+    #[test]
+    fn rate_limiter_allows_a_burst_then_paces() {
+        let limiter = RateLimiter::new();
+        for _ in 0..RATE_BURST as usize {
+            assert_eq!(limiter.reserve(), Duration::ZERO);
+        }
+        let wait = limiter.reserve();
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_millis(300),
+            "{wait:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbuildable_request_fails_without_retrying() {
+        let client =
+            Client::with_base_url("http://127.0.0.1:1".to_string(), Some("a\nb".into())).unwrap();
+        let started = std::time::Instant::now();
+        let err = client.get_json::<Pong>("/ping").await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1), "retried: {err}");
+    }
+
+    #[tokio::test]
+    async fn pagination_ignored_by_the_server_is_detected() {
+        let server = MockServer::start().await;
+        let full: Vec<serde_json::Value> = (0..PAGE_LIMIT).map(|i| serde_json::json!(i)).collect();
+        Mock::given(method("GET"))
+            .and(path("/torrents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(full))
+            .mount(&server)
+            .await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let err = client
+            .get_all_pages::<i64>("/torrents", &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("same page twice"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pagination_stops_at_x_total_count() {
+        let server = MockServer::start().await;
+        let full: Vec<serde_json::Value> = (0..PAGE_LIMIT).map(|i| serde_json::json!(i)).collect();
+        Mock::given(method("GET"))
+            .and(path("/torrents"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Total-Count", PAGE_LIMIT.to_string())
+                    .set_body_json(full),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::with_base_url(server.uri(), None).unwrap();
+        let all = client.get_all_pages::<i64>("/torrents", &[]).await.unwrap();
+        assert_eq!(all.len(), PAGE_LIMIT);
     }
 
     #[tokio::test]

@@ -31,8 +31,9 @@ rd auth login
 rd auth whoami
 ```
 
-Your token is stored at `~/.config/rd/config.toml` with `0600` permissions on
-Unix systems.
+Your token is stored in `config.toml` in your user config directory
+(`~/.config/rd` on Linux, `~/Library/Application Support/rd` on macOS,
+`%APPDATA%\rd\config` on Windows), readable only by you on Unix.
 
 ## Usage
 
@@ -88,6 +89,8 @@ rd completions zsh > ~/.zfunc/_rd
 - `RD_CONFIG_DIR`: directory holding `config.toml`
 - `RD_API_URL`: API base URL (the end-to-end tests point this at a fake server)
 - `RD_POLL_MS`: torrent status poll interval in milliseconds (default 5000)
+- `RD_CA_CERT`: extra PEM root certificate to trust (e.g. a TLS-inspecting proxy)
+- `RD_READ_TIMEOUT_SECS`: give up on a connection that sends nothing for this long (default 60)
 
 ## Development
 
@@ -98,3 +101,15 @@ cargo clippy --all-targets -- -D warnings
 
 `tests/e2e.rs` runs the real binary against a fake Real-Debrid
 (`tests/support/mod.rs`), so it needs no account or network access.
+
+Two more suites only run when asked for:
+
+```bash
+# Docker: nginx, HTTPS with a private CA (Caddy), network faults
+# (toxiproxy), and an undersized disk (tmpfs)
+cargo test --features container-tests --test containers -- --test-threads 2
+
+# Real Real-Debrid, using your account. live_download_round_trip adds a
+# small legal torrent, downloads it twice (~560 MB) and deletes it again.
+RD_LIVE=1 cargo test --test live -- --ignored --nocapture --test-threads 1
+```

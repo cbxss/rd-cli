@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod download;
+mod http;
 mod output;
 mod torrent;
 
@@ -14,6 +15,13 @@ use cli::{AuthCommand, Cli, Commands, DownloadsCommand, TorrentsCommand};
 
 #[tokio::main]
 async fn main() {
+    // Exit quietly when stdout is closed early (`rd torrents list | head`),
+    // like other Unix tools, instead of panicking on the failed write.
+    #[cfg(unix)]
+    // SAFETY: restoring the default disposition of a signal at startup.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     if let Err(err) = run().await {
         eprintln!("error: {err:#}");
         std::process::exit(1);

@@ -1,10 +1,10 @@
 //! `rd dl`: one command for magnets, .torrent files, torrent/download IDs,
 //! hoster links, and files listing hoster links.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::api::Client;
 use crate::api::models::{DownloadEntry, TorrentInfo};
@@ -63,18 +63,9 @@ fn link_opts(args: &DlArgs) -> LinkOpts {
     }
 }
 
-pub fn prepare_out_dir(output_dir: Option<&str>) -> Result<PathBuf> {
-    let Some(dir) = output_dir else {
-        return Ok(PathBuf::from("."));
-    };
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create output directory {dir}"))?;
-    Ok(PathBuf::from(dir))
-}
-
 async fn run_torrent(args: DlArgs) -> Result<()> {
     let client = Client::from_config()?;
-    let out_dir = prepare_out_dir(args.output_dir.as_deref())?;
+    let out_dir = download::prepare_out_dir(args.output_dir.as_deref())?;
     let id = torrent::add_or_reuse(&client, &args.link, args.host.as_deref(), args.quiet).await?;
     torrent::download(
         &client,
@@ -91,7 +82,7 @@ async fn run_torrent(args: DlArgs) -> Result<()> {
 /// download-history ID (from `rd downloads list`).
 async fn run_existing(args: DlArgs) -> Result<()> {
     let client = Client::from_config()?;
-    let out_dir = prepare_out_dir(args.output_dir.as_deref())?;
+    let out_dir = download::prepare_out_dir(args.output_dir.as_deref())?;
 
     match client
         .get_json::<TorrentInfo>(&format!("/torrents/info/{}", args.link))
@@ -117,20 +108,13 @@ async fn run_existing(args: DlArgs) -> Result<()> {
                 );
             };
             let dest = out_dir.join(download::safe_filename(&entry.filename));
-            if !args.quiet {
-                download::status(&format!(
-                    "downloading {} -> {}",
-                    entry.filename,
-                    dest.display()
-                ));
-            }
             let opts = DownloadOpts {
-                concurrency: torrent::cap_connections(args.concurrency, entry.chunks),
+                concurrency: args.concurrency,
                 quiet: args.quiet,
             };
-            download::fetch(&entry.download, &dest, opts)
+            download::fetch_file(&entry.download, &entry.filename, entry.chunks, &dest, opts)
                 .await
-                .with_context(|| format!("failed to download {}", entry.filename))
+                .map(|_| ())
         }
         Err(err) => Err(err.into()),
     }

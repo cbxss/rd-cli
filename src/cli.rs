@@ -130,8 +130,10 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     };
     num.trim()
         .parse::<u64>()
-        .map(|n| std::time::Duration::from_secs(n * mult))
-        .map_err(|_| format!("invalid duration '{s}' (use e.g. 90s, 30m, 2h)"))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| format!("invalid duration '{s}' (use e.g. 90s, 30m, 2h)"))
 }
 
 #[cfg(test)]
@@ -146,6 +148,7 @@ mod tests {
         assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
         assert_eq!(parse_duration("0"), Ok(Duration::ZERO));
         assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("999999999999999999h").is_err());
     }
 }
 
@@ -156,7 +159,7 @@ pub enum TorrentsCommand {
         magnet_or_file: String,
         #[arg(long)]
         host: Option<String>,
-        /// Select files immediately: "all" or a comma-separated list of file ids
+        /// Select files once the magnet is converted: "all" or comma-separated file ids (download with `rd dl <id>`)
         #[arg(long)]
         select: Option<String>,
     },
@@ -169,7 +172,7 @@ pub enum TorrentsCommand {
     },
     /// Show torrent details
     Info { id: String },
-    /// Select which files to download from a torrent
+    /// Choose which files of a torrent Real-Debrid fetches ("all" or comma-separated file ids); download with `rd dl <id>`
     Select { id: String, files: String },
     /// Delete a torrent
     Delete { id: String },

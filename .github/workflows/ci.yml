@@ -26,3 +26,8 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The Docker suite is run by hand; this only keeps it compiling.
+      - name: Check container tests
+        if: runner.os == 'Linux'
+        run: cargo clippy --tests --features container-tests --locked -- -D warnings

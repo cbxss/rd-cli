@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -13,9 +13,13 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
     // Fails fast, before touching the network, if there is no token.
     let client = Client::from_config()?;
 
+    let bulk = Path::new(&args.link).is_file();
     let links = collect_links(&args.link)?;
     if links.is_empty() {
         anyhow::bail!("no links found in {}", args.link);
+    }
+    if bulk && args.output_file.is_some() {
+        anyhow::bail!("-O/--output-file only works with a single link, not a file of links");
     }
 
     let mut successes: Vec<UnrestrictedLink> = Vec::new();
@@ -25,7 +29,7 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
         match unrestrict_one(&client, link, args.password.as_deref()).await {
             Ok(ul) => {
                 if !args.quiet && !args.list && !args.json {
-                    println!("unrestricted: {link} -> {}", ul.filename);
+                    download::status(&format!("unrestricted: {link} -> {}", ul.filename));
                 }
                 successes.push(ul);
             }
@@ -50,7 +54,7 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
         // Bulk (file) mode always prints an array, even if it only contained a
         // single link; a single link passed directly on the command line
         // prints a bare object.
-        if links.len() == 1 {
+        if !bulk {
             if let Some(ul) = successes.first() {
                 output::print_json(ul)?;
             }
@@ -69,44 +73,26 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
         return finish(failures, links.len());
     }
 
-    let out_dir = args
-        .output_dir
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    if args.output_dir.is_some() {
-        fs::create_dir_all(&out_dir)
-            .with_context(|| format!("failed to create output directory {}", out_dir.display()))?;
-    }
-
-    // -O only makes sense when exactly one file will end up being downloaded;
-    // with more than one result we ignore it and use each link's own filename.
-    let single = successes.len() == 1;
-
+    let out_dir = download::prepare_out_dir(args.output_dir.as_deref())?;
+    // With --json, stdout carries only the JSON document.
+    let opts = DownloadOpts {
+        concurrency: args.concurrency,
+        quiet: args.quiet || args.json,
+    };
+    // Several links can resolve to the same file name; give each its own.
+    let mut claimed = std::collections::HashSet::new();
     for ul in &successes {
-        // -O is the user's own choice and may include a path; the filename
-        // Real-Debrid returns is not, so it's reduced to a bare file name.
-        let filename = match (&args.output_file, single) {
-            (Some(name), true) => name.clone(),
-            _ => download::safe_filename(&ul.filename),
+        // -O is the user's own choice and may include a path; the name
+        // Real-Debrid returns is reduced to a bare, portable file name.
+        let filename = match &args.output_file {
+            Some(name) => name.clone(),
+            None => download::unique_name(&mut claimed, &download::safe_filename(&ul.filename)),
         };
-        let dest = out_dir.join(&filename);
-
-        // With --json, stdout carries only the JSON document.
-        if !args.quiet && !args.json {
-            download::status(&format!(
-                "downloading {} -> {}",
-                ul.filename,
-                dest.display()
-            ));
-        }
-
-        let opts = DownloadOpts {
-            concurrency: crate::torrent::cap_connections(args.concurrency, ul.chunks),
-            quiet: args.quiet,
-        };
-        if let Err(err) = download::fetch(&ul.download, &dest, opts).await {
-            eprintln!("error: failed to download {}: {err:#}", ul.filename);
+        let dest = out_dir.join(filename);
+        if let Err(err) =
+            download::fetch_file(&ul.download, &ul.filename, ul.chunks, &dest, opts).await
+        {
+            eprintln!("error: {err:#}");
             failures += 1;
         }
     }
@@ -146,7 +132,7 @@ fn collect_links(link_arg: &str) -> Result<Vec<String>> {
             .with_context(|| format!("failed to read link file {}", path.display()))?;
         Ok(contents
             .lines()
-            .map(str::trim)
+            .map(|line| line.trim_start_matches('\u{feff}').trim())
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .map(str::to_string)
             .collect())
@@ -177,7 +163,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            "https://a.example.com/1\n\n# a comment\n  https://b.example.com/2  \n",
+            "\u{feff}https://a.example.com/1\n\n# a comment\n  https://b.example.com/2  \n",
         )
         .unwrap();
 

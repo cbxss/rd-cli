@@ -24,6 +24,14 @@ pub enum RdError {
 
     #[error("rate limited after retries")]
     RateLimited,
+
+    /// Bad local settings (e.g. an unreadable `RD_CA_CERT`).
+    #[error("{0}")]
+    Config(String),
+
+    /// The API answered in a way we can't work with.
+    #[error("{0}")]
+    Protocol(String),
 }
 
 /// Extra guidance for errors a user can act on.

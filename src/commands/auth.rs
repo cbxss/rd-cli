@@ -19,22 +19,27 @@ pub async fn login() -> Result<()> {
         .await
         .context("token validation failed — check the token and try again")?;
 
-    let mut config = Config::load_file()?;
+    // A damaged config file is simply replaced.
+    let mut config = Config::load_file().unwrap_or_default();
     config.api_token = Some(token);
     config.save()?;
 
     println!("Logged in as {} ({})", user.username, user.email);
+    if std::env::var("RD_TOKEN").is_ok_and(|t| !t.trim().is_empty()) {
+        println!("Note: RD_TOKEN is set and takes precedence over the saved token.");
+    }
     Ok(())
 }
 
 pub fn logout() -> Result<()> {
-    let mut config = Config::load_file()?;
-    if config.api_token.is_none() {
+    if Config::clear_saved_token()? {
+        println!("Logged out.");
+    } else {
         println!("Not logged in.");
-        return Ok(());
     }
-    config.clear()?;
-    println!("Logged out.");
+    if std::env::var("RD_TOKEN").is_ok_and(|t| !t.trim().is_empty()) {
+        println!("Note: RD_TOKEN is still set, so commands keep using that token.");
+    }
     Ok(())
 }
 
@@ -43,7 +48,7 @@ pub async fn whoami(json: bool) -> Result<()> {
     let user: User = client.get_json("/user").await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&user)?);
+        crate::output::print_json(&user)?;
     } else {
         println!("Username:    {}", user.username);
         println!("Email:       {}", user.email);

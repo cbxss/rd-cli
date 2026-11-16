@@ -5,6 +5,9 @@
 
 #![allow(dead_code)]
 
+pub mod cli;
+pub use cli::*;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -145,6 +148,13 @@ pub struct Faults {
     /// Answer the next N `addMagnet` calls with a 503 *after* creating the
     /// torrent (the server acted, the client can't tell).
     pub add_magnet_5xx_after_create: u32,
+    /// End every file body (except probes) after this many bytes, as if the
+    /// connection dropped.
+    pub cut_bodies_after: Option<u64>,
+    /// Answer the next N probes (`Range: bytes=0-0`) with a 503.
+    pub fail_probes: u32,
+    /// Answer the next N non-probe range requests with this status.
+    pub fail_next_ranges: Option<(u16, u32)>,
 }
 
 #[derive(Default)]
@@ -160,7 +170,14 @@ struct Inner {
     premature_selects: u32,
     /// `(start, end)` of every non-probe ranged file request.
     ranges: Vec<(u64, u64)>,
+    /// Every file request except the 1-byte probe, ranged or not.
+    file_gets: u32,
+    /// `selectFiles` calls that changed a selection.
+    selects: u32,
     unrestricts: u64,
+    /// When set, unrestricted links point here (`{base}/{file name}`)
+    /// instead of at the fake's own file server.
+    download_base: Option<String>,
 }
 
 #[derive(Clone)]
@@ -239,6 +256,12 @@ impl Fake {
         id
     }
 
+    /// Serve file bodies from another server (e.g. an nginx container) that
+    /// has each file under its base name.
+    pub fn serve_files_from(&self, base: &str) {
+        self.lock().download_base = Some(base.trim_end_matches('/').to_string());
+    }
+
     pub fn faults(&self, f: impl FnOnce(&mut Faults)) {
         f(&mut self.lock().faults);
     }
@@ -253,6 +276,15 @@ impl Fake {
 
     pub fn torrent_count(&self) -> usize {
         self.lock().torrents.len()
+    }
+
+    /// Takes (and clears) the count of file requests other than probes.
+    pub fn select_count(&self) -> u32 {
+        self.lock().selects
+    }
+
+    pub fn take_file_gets(&self) -> u32 {
+        std::mem::take(&mut self.lock().file_gets)
     }
 
     /// Takes (and clears) the ranged file requests seen so far.
@@ -449,6 +481,7 @@ async fn select_files(
         }
         _ => return StatusCode::ACCEPTED.into_response(), // "action already done"
     }
+    inner.selects += 1;
     let files = form.get("files").cloned().unwrap_or_default();
     let t = &mut inner.torrents[idx];
     for (i, file) in t.files.iter_mut().enumerate() {
@@ -487,7 +520,10 @@ async fn unrestrict(State(f): State<Fake>, Form(form): Form<HashMap<String, Stri
     Json(json!({
         "id": format!("U{}", inner.unrestricts), "filename": filename,
         "filesize": data.len(), "link": link, "host": "fake", "chunks": 32,
-        "download": format!("{base}/files/{key}?u={}", inner.unrestricts),
+        "download": match &inner.download_base {
+            Some(ext) => format!("{ext}/{filename}"),
+            None => format!("{base}/files/{key}?u={}", inner.unrestricts),
+        },
         "streamable": 0,
     }))
     .into_response()
@@ -530,6 +566,25 @@ async fn serve_file(
     let total = data.len() as u64;
     let range = parse_range(&headers).filter(|&(s, e)| s <= e && e < total);
     let is_probe = range == Some((0, 0));
+    let mut cut = None;
+    {
+        let mut inner = f.lock();
+        if is_probe && inner.faults.fail_probes > 0 {
+            inner.faults.fail_probes -= 1;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if !is_probe {
+            inner.file_gets += 1;
+            cut = inner.faults.cut_bodies_after;
+            if let (Some(_), Some((code, n))) = (range, inner.faults.fail_next_ranges.as_mut()) {
+                if *n > 0 {
+                    *n -= 1;
+                    let code = *code;
+                    return StatusCode::from_u16(code).unwrap().into_response();
+                }
+            }
+        }
+    }
     if let Some(r) = range.filter(|_| !is_probe) {
         f.lock().ranges.push(r);
         if let Some(code) = fail_with {
@@ -555,13 +610,15 @@ async fn serve_file(
     }
 
     const PIECE: u64 = 1024 * 1024;
+    // The body may be cut short (the Content-Length still promises all of it).
+    let last = cut.map_or(end, |n| end.min(start + n.max(1) - 1));
     let stream = futures_util::stream::unfold(start, move |pos| {
         let data = data.clone();
         async move {
-            if len == 0 || pos > end {
+            if len == 0 || pos > last {
                 return None;
             }
-            let stop = (pos + PIECE).min(end + 1);
+            let stop = (pos + PIECE).min(last + 1);
             if throttle > 0 {
                 tokio::time::sleep(Duration::from_millis(throttle)).await;
             }
