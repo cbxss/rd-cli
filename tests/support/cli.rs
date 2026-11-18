@@ -21,10 +21,13 @@ pub const AMBIENT_ENV: &[&str] = &[
     "RD_POLL_MS",
     "RD_CA_CERT",
     "RD_READ_TIMEOUT_SECS",
+    "RD_PROGRESS_MS",
 ];
 
 pub struct Out {
     pub ok: bool,
+    /// Exit code (`None` if killed by a signal).
+    pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -63,6 +66,7 @@ pub fn run(mut cmd: Command, timeout: Duration) -> Out {
     };
     let out = Out {
         ok: status.success(),
+        code: status.code(),
         stdout: read_out.join().unwrap(),
         stderr: read_err.join().unwrap(),
     };

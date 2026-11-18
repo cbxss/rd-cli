@@ -3,7 +3,7 @@
 //! then unrestrict and download its links.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use futures_util::{StreamExt, stream};
 use crate::api::Client;
 use crate::api::error::RdError;
 use crate::api::models::{AddMagnetResponse, Torrent, TorrentInfo, UnrestrictedLink};
-use crate::download::{self, DownloadOpts};
+use crate::download::{self, DownloadOpts, Report};
 
 pub const TERMINAL_FAILURE_STATUSES: &[&str] = &["error", "virus", "dead", "magnet_error"];
 
@@ -126,14 +126,62 @@ fn base32_to_hex(s: &str) -> Option<String> {
     (out.len() == 40).then_some(out)
 }
 
+/// Whether Real-Debrid is still before the file-selection step, so a
+/// selection can still be made.
+pub fn awaiting_selection(info: &TorrentInfo) -> bool {
+    matches!(
+        info.status.as_str(),
+        "magnet_conversion" | "waiting_files_selection"
+    )
+}
+
+/// Whether the torrent's selected files are exactly `files` ("all" or
+/// comma-separated ids).
+pub fn selection_matches(info: &TorrentInfo, files: &str) -> bool {
+    if files == "all" {
+        return info.files.iter().all(|f| f.selected != 0);
+    }
+    let want: HashSet<i64> = files.split(',').filter_map(|x| x.parse().ok()).collect();
+    let have: HashSet<i64> = info
+        .files
+        .iter()
+        .filter(|f| f.selected != 0)
+        .map(|f| f.id)
+        .collect();
+    want == have
+}
+
+/// Fails if `id` already has a selection other than `files`: Real-Debrid
+/// can't change a selection once made, and downloading the old one would
+/// silently ignore `--select`.
+pub async fn ensure_selection(client: &Client, id: &str, files: &str) -> Result<()> {
+    let info = get_info(client, id).await?;
+    if awaiting_selection(&info) || selection_matches(&info, files) {
+        return Ok(());
+    }
+    let have: Vec<String> = info
+        .files
+        .iter()
+        .filter(|f| f.selected != 0)
+        .map(|f| f.id.to_string())
+        .collect();
+    anyhow::bail!(
+        "torrent {id} already has files {} selected, not {files}, and Real-Debrid can't change a \
+         selection once made. Download it as it is with `rd dl {id}`, or pass the magnet to \
+         `rd dl --select {files}`, which adds a new copy.",
+        have.join(",")
+    )
+}
+
 /// Finds a torrent already on the account with this hash that hasn't failed
-/// and will deliver every file (not yet selected, or all files selected),
-/// preferring one that has finished downloading. A copy where only some files
-/// were picked is skipped, since `rd dl` promises the whole torrent.
+/// and will deliver exactly `files` (not yet selected, or that selection),
+/// preferring one that has finished downloading. A copy with a different
+/// selection is skipped.
 async fn find_existing(
     client: &Client,
     torrents: &[Torrent],
     hash: &str,
+    files: &str,
 ) -> Result<Option<Torrent>> {
     let mut candidates: Vec<Torrent> = torrents
         .iter()
@@ -149,11 +197,7 @@ async fn find_existing(
         let Ok(info) = get_info(client, &t.id).await else {
             continue;
         };
-        let unselected = matches!(
-            info.status.as_str(),
-            "magnet_conversion" | "waiting_files_selection"
-        );
-        if unselected || info.files.iter().all(|f| f.selected != 0) {
+        if awaiting_selection(&info) || selection_matches(&info, files) {
             return Ok(Some(t));
         }
     }
@@ -261,17 +305,19 @@ pub async fn add(client: &Client, link: &str, host: Option<&str>) -> Result<Stri
     Ok(resp.id)
 }
 
-/// Like [`add`], but reuses a usable torrent with the same magnet hash.
+/// Like [`add`], but reuses a torrent with the same magnet hash that will
+/// deliver `files`.
 pub async fn add_or_reuse(
     client: &Client,
     link: &str,
     host: Option<&str>,
+    files: &str,
     quiet: bool,
 ) -> Result<String> {
     let id = match magnet_hash(link) {
         Some(hash) => {
             let torrents = list_torrents(client).await?;
-            if let Some(existing) = find_existing(client, &torrents, &hash).await? {
+            if let Some(existing) = find_existing(client, &torrents, &hash, files).await? {
                 if !quiet {
                     download::status(&format!(
                         "reusing existing torrent {} ({})",
@@ -331,14 +377,15 @@ impl StallGuard {
                 .seeders
                 .map(|s| format!(", {s} seeders"))
                 .unwrap_or_default();
-            anyhow::bail!(
+            return Err(download::Incomplete(format!(
                 "torrent {id} made no progress for {} (status '{}', {:.1}%{seeders}). \
                  It is still on Real-Debrid: run `rd dl {id}` to keep waiting, or \
                  `rd torrents delete {id}` to give up.",
                 human_duration(timeout),
                 info.status,
                 info.progress,
-            );
+            ))
+            .into());
         }
         Ok(())
     }
@@ -348,10 +395,11 @@ impl StallGuard {
     /// Called when a poll failed temporarily: no news counts as no progress.
     fn check_unreachable(&self, id: &str) -> Result<()> {
         match self.timeout {
-            Some(timeout) if self.since.elapsed() >= timeout => anyhow::bail!(
+            Some(timeout) if self.since.elapsed() >= timeout => Err(download::Incomplete(format!(
                 "couldn't reach Real-Debrid for {} while waiting on torrent {id}; run `rd dl {id}` to keep waiting",
                 human_duration(timeout)
-            ),
+            ))
+            .into()),
             _ => Ok(()),
         }
     }
@@ -484,7 +532,9 @@ pub struct LinkOpts {
     pub jobs: usize,
 }
 
-/// Waits for the torrent, then downloads all of its links.
+/// Waits for the torrent, then downloads all of its links. With
+/// `output_file`, the torrent must deliver exactly one file, saved under
+/// that name.
 pub async fn download(
     client: &Client,
     id: &str,
@@ -492,22 +542,57 @@ pub async fn download(
     out_dir: &Path,
     opts: LinkOpts,
     stall: Option<Duration>,
-) -> Result<()> {
+    output_file: Option<&str>,
+) -> Result<Report> {
     let info = wait_for_links(client, id, files, opts.quiet, stall).await?;
-    download_links(client, &info.links, out_dir, opts).await
+    if output_file.is_some() && info.links.len() != 1 {
+        anyhow::bail!(
+            "-O/--output-file needs a single file, but torrent {id} has {} links; \
+             pick one with --select (file ids: `rd torrents info {id}`)",
+            info.links.len()
+        );
+    }
+    Ok(download_links(client, &info.links, out_dir, opts, output_file).await)
+}
+
+/// Waits for the torrent, then unrestricts its links and returns the direct
+/// download URLs, without downloading anything.
+pub async fn direct_links(
+    client: &Client,
+    id: &str,
+    files: &str,
+    quiet: bool,
+    stall: Option<Duration>,
+) -> Result<Vec<String>> {
+    let info = wait_for_links(client, id, files, quiet, stall).await?;
+    let mut urls = Vec::with_capacity(info.links.len());
+    for link in &info.links {
+        let ul: UnrestrictedLink = client
+            .post_form("/unrestrict/link", &[("link", link.as_str())])
+            .await
+            .with_context(|| format!("failed to unrestrict {link}"))?;
+        urls.push(ul.download);
+    }
+    Ok(urls)
 }
 
 /// Unrestricts and downloads `links` into `out_dir`, `opts.jobs` at a time.
 /// Every link is attempted; files that fail get one more try on their own
-/// (with a freshly unrestricted link), and remaining failures are reported.
+/// (with a freshly unrestricted link), and remaining failures are reported
+/// on stderr and in the returned [`Report`].
 pub async fn download_links(
     client: &Client,
     links: &[String],
     out_dir: &Path,
     opts: LinkOpts,
-) -> Result<()> {
-    let mut names = Names::default();
-    let mut failed = run_pass(
+    output_file: Option<&str>,
+) -> Report {
+    let mut names = Names {
+        fixed: output_file.map(str::to_string),
+        ..Names::default()
+    };
+    let mut report = Report::default();
+    let (done, mut failed) = run_pass(
         client,
         links.iter().collect(),
         out_dir,
@@ -516,6 +601,7 @@ pub async fn download_links(
         opts.jobs,
     )
     .await;
+    let mut done_paths = done;
 
     // A second, sequential pass: parallel downloads can hit limits a single
     // one doesn't (Real-Debrid's active-download cap, per-host connection
@@ -528,22 +614,25 @@ pub async fn download_links(
             ));
         }
         let retry: Vec<&String> = failed.iter().map(|(link, _)| *link).collect();
-        failed = run_pass(client, retry, out_dir, opts, &mut names, 1).await;
+        let (done, still_failed) = run_pass(client, retry, out_dir, opts, &mut names, 1).await;
+        done_paths.extend(done);
+        failed = still_failed;
     }
 
-    for (_, err) in &failed {
+    for path in &done_paths {
+        report.add_file(path);
+    }
+    for (link, err) in &failed {
         eprintln!("error: {err:#}");
+        report.add_failure(link, err);
     }
-    if !failed.is_empty() {
-        anyhow::bail!("{} of {} file(s) failed", failed.len(), links.len());
-    }
-    Ok(())
+    report
 }
 
 /// One pass over `batch`: unrestrict every link, name the files in link
 /// order (so duplicate names resolve the same way on every run, however the
 /// parallel requests finish), then download `jobs` at a time. Returns the
-/// links that failed.
+/// paths written and the links that failed.
 async fn run_pass<'a>(
     client: &Client,
     batch: Vec<&'a String>,
@@ -551,7 +640,7 @@ async fn run_pass<'a>(
     opts: LinkOpts,
     names: &mut Names,
     jobs: usize,
-) -> Vec<(&'a String, anyhow::Error)> {
+) -> (Vec<PathBuf>, Vec<(&'a String, anyhow::Error)>) {
     let jobs = jobs.max(1);
     let resolved: Vec<(&String, Result<UnrestrictedLink>)> = stream::iter(batch)
         .map(|link| async move {
@@ -577,7 +666,7 @@ async fn run_pass<'a>(
         }
     }
 
-    let results: Vec<(&String, Result<()>)> = stream::iter(work)
+    let results: Vec<(&String, Result<PathBuf>)> = stream::iter(work)
         .map(|(link, ul, dest)| async move {
             let opts = DownloadOpts {
                 concurrency: opts.concurrency,
@@ -585,17 +674,19 @@ async fn run_pass<'a>(
             };
             let res =
                 download::fetch_file(&ul.download, &ul.filename, ul.chunks, &dest, opts).await;
-            (link, res.map(|_| ()))
+            (link, res)
         })
         .buffer_unordered(jobs)
         .collect()
         .await;
-    failures.extend(
-        results
-            .into_iter()
-            .filter_map(|(link, res)| res.err().map(|e| (link, e))),
-    );
-    failures
+    let mut done = Vec::new();
+    for (link, res) in results {
+        match res {
+            Ok(path) => done.push(path),
+            Err(e) => failures.push((link, e)),
+        }
+    }
+    (done, failures)
 }
 
 /// Output names for the links of one download. Files in different torrent
@@ -606,10 +697,15 @@ async fn run_pass<'a>(
 struct Names {
     taken: HashSet<String>,
     by_link: HashMap<String, String>,
+    /// `-O`: the user's name for the (single) file.
+    fixed: Option<String>,
 }
 
 impl Names {
     fn for_link(&mut self, link: &str, name: &str) -> String {
+        if let Some(fixed) = &self.fixed {
+            return fixed.clone();
+        }
         if let Some(existing) = self.by_link.get(link) {
             return existing.clone();
         }
@@ -1088,9 +1184,15 @@ mod tests {
             .await;
 
         let client = Client::with_base_url(server.uri(), None).unwrap();
-        let id = add_or_reuse(&client, &format!("magnet:?xt=urn:btih:{h}"), None, true)
-            .await
-            .unwrap();
+        let id = add_or_reuse(
+            &client,
+            &format!("magnet:?xt=urn:btih:{h}"),
+            None,
+            "all",
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(id, "NEW");
     }
 
@@ -1127,9 +1229,15 @@ mod tests {
             .await;
 
         let client = Client::with_base_url(server.uri(), None).unwrap();
-        let id = add_or_reuse(&client, &format!("magnet:?xt=urn:btih:{h}"), None, true)
-            .await
-            .unwrap();
+        let id = add_or_reuse(
+            &client,
+            &format!("magnet:?xt=urn:btih:{h}"),
+            None,
+            "all",
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(id, "GOOD");
     }
 }

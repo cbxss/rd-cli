@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -22,6 +22,123 @@ pub struct DownloadOpts {
     /// Suppress status lines and progress bars.
     pub quiet: bool,
 }
+
+/// What a download command achieved, for `--json` and the exit code.
+#[derive(Debug, Default, Serialize)]
+pub struct Report {
+    /// Files on disk (downloaded now, or already there from an earlier run).
+    pub files: Vec<FileOut>,
+    /// Links that couldn't be unrestricted or downloaded.
+    pub failed: Vec<Failure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileOut {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Failure {
+    pub link: String,
+    pub error: String,
+    /// Whether rerunning the same command may fix it (a dropped or expired
+    /// download, Real-Debrid busy), as opposed to e.g. a dead link or a
+    /// full disk.
+    pub retryable: bool,
+}
+
+/// Not enough free space for a download; rerunning won't help until space
+/// is freed.
+#[derive(Debug)]
+pub struct NoSpace(String);
+
+impl std::fmt::Display for NoSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoSpace {}
+
+/// See [`Failure::retryable`]. Real-Debrid errors count only when transient
+/// (network, rate limiting, 5xx, too many active downloads); failures while
+/// transferring a file count unless the disk is full.
+pub fn is_retryable(err: &anyhow::Error) -> bool {
+    use crate::api::error::RdError;
+    if err.chain().any(|e| e.is::<NoSpace>()) {
+        return false;
+    }
+    match err.chain().find_map(|e| e.downcast_ref::<RdError>()) {
+        Some(RdError::Http(_) | RdError::RateLimited) => true,
+        // 24 (unavailable_file) and 35 (infringing_file) come back as 503
+        // but mean the file is gone; 21 is too_many_active_downloads, 34
+        // too_many_requests.
+        Some(RdError::Api { code: 24 | 35, .. }) => false,
+        Some(RdError::Api { status, code, .. }) => *status >= 500 || matches!(code, 21 | 34),
+        Some(_) => false,
+        None => true,
+    }
+}
+
+impl Report {
+    pub fn add_file(&mut self, path: &Path) {
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        self.files.push(FileOut {
+            path: path.display().to_string(),
+            bytes,
+        });
+    }
+
+    pub fn add_failure(&mut self, link: &str, err: &anyhow::Error) {
+        self.failed.push(Failure {
+            link: link.to_string(),
+            error: format!("{err:#}"),
+            retryable: is_retryable(err),
+        });
+    }
+
+    /// Prints the JSON summary if asked, then fails if anything failed (each
+    /// failure was already reported on stderr): with [`Incomplete`] when a
+    /// rerun may fix at least one of them.
+    pub fn finish(self, json: bool) -> Result<()> {
+        if json {
+            crate::output::print_json(&self)?;
+        }
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        let total = self.files.len() + self.failed.len();
+        let msg = format!("{} of {total} file(s) failed", self.failed.len());
+        if self.failed.iter().any(|f| f.retryable) {
+            Err(Incomplete(format!(
+                "{msg}; rerun the same command to retry them (finished files are skipped)"
+            ))
+            .into())
+        } else {
+            Err(anyhow::anyhow!(msg))
+        }
+    }
+}
+
+/// Marks a failure that rerunning the same command may fix: downloads that
+/// failed in a retryable way (finished files are skipped and partial ones
+/// resume on a rerun) or a torrent that stopped making progress. `main` exits with
+/// [`Incomplete::EXIT_CODE`] for it.
+#[derive(Debug)]
+pub struct Incomplete(pub String);
+
+impl Incomplete {
+    pub const EXIT_CODE: i32 = 3;
+}
+
+impl std::fmt::Display for Incomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Incomplete {}
 
 /// Files at least this big use the chunked path, which is resumable (even
 /// with one connection); smaller ones are fetched in one stream.
@@ -163,12 +280,13 @@ fn ensure_space(dest: &Path, needed: u64) -> Result<()> {
 
 fn check_space(needed: u64, free: u64, dir: &Path) -> Result<()> {
     if needed > free {
-        anyhow::bail!(
+        return Err(NoSpace(format!(
             "not enough disk space in {}: need {}, only {} free",
             dir.display(),
             crate::output::human_bytes(needed as i64),
             crate::output::human_bytes(free as i64),
-        );
+        ))
+        .into());
     }
     Ok(())
 }
@@ -491,6 +609,9 @@ async fn fetch(url: &str, label: &str, dest: &Path, opts: DownloadOpts) -> Resul
         .filter(|&size| probed.supports_ranges && size >= SEGMENT_THRESHOLD);
     let Some(total) = chunked_size else {
         fetch_single_stream(client, url, &path, probed.total_size, opts).await?;
+        if !opts.quiet {
+            status(&format!("finished: {}", path.display()));
+        }
         return Ok(path);
     };
     match fetch_segmented(client, url, &path, total, opts).await {
@@ -508,12 +629,102 @@ async fn fetch(url: &str, label: &str, dest: &Path, opts: DownloadOpts) -> Resul
         other => other?,
     }
     drop(claim);
+    if !opts.quiet {
+        status(&format!("finished: {}", path.display()));
+    }
     Ok(path)
 }
 
-fn make_progress_bar(total: Option<u64>, quiet: bool) -> ProgressBar {
+/// A progress bar, plus — when bars can't be drawn (output redirected to a
+/// log, `nohup`, an agent capturing output) — a ticker printing a plain
+/// progress line every `RD_PROGRESS_MS` (default 30s). The ticker stops when
+/// this is dropped, on every exit path.
+struct Progress {
+    pb: ProgressBar,
+    ticker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl std::ops::Deref for Progress {
+    type Target = ProgressBar;
+    fn deref(&self) -> &ProgressBar {
+        &self.pb
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticker.take() {
+            t.abort();
+        }
+    }
+}
+
+fn plain_progress_interval() -> Duration {
+    std::env::var("RD_PROGRESS_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+}
+
+/// `47s`, `12m`, `3h05m`.
+fn short_duration(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// One plain progress line. `rate` is bytes/second over the last interval.
+fn plain_progress_line(label: &str, done: u64, total: Option<u64>, rate: f64) -> String {
+    use crate::output::human_bytes;
+    let speed = format!("{}/s", human_bytes(rate as i64));
+    match total.filter(|&t| t > 0) {
+        Some(total) => {
+            let pct = done as f64 * 100.0 / total as f64;
+            let eta = if rate >= 1.0 {
+                short_duration((total.saturating_sub(done) as f64 / rate) as u64)
+            } else {
+                "?".to_string()
+            };
+            format!(
+                "progress: {label}: {} / {} ({pct:.1}%), {speed}, ETA {eta}",
+                human_bytes(done as i64),
+                human_bytes(total as i64)
+            )
+        }
+        None => format!(
+            "progress: {label}: {} so far, {speed}",
+            human_bytes(done as i64)
+        ),
+    }
+}
+
+fn spawn_plain_progress(pb: ProgressBar, label: String) -> tokio::task::JoinHandle<()> {
+    let interval = plain_progress_interval();
+    tokio::spawn(async move {
+        let mut last = (Instant::now(), pb.position());
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = (Instant::now(), pb.position());
+            let secs = now.0.duration_since(last.0).as_secs_f64();
+            let rate = now.1.saturating_sub(last.1) as f64 / secs.max(0.001);
+            last = now;
+            status(&plain_progress_line(&label, now.1, pb.length(), rate));
+        }
+    })
+}
+
+/// Creates the bar for downloading to `dest`, already at `start` bytes (so
+/// resumed bytes don't count towards the speed).
+fn make_progress_bar(total: Option<u64>, quiet: bool, dest: &Path, start: u64) -> Progress {
     if quiet {
-        return ProgressBar::hidden();
+        return Progress {
+            pb: ProgressBar::hidden(),
+            ticker: None,
+        };
     }
     let pb = match total {
         Some(total) => {
@@ -538,7 +749,16 @@ fn make_progress_bar(total: Option<u64>, quiet: bool) -> ProgressBar {
             pb
         }
     };
-    bars().add(pb)
+    pb.set_position(start);
+    let pb = bars().add(pb);
+    let ticker = bars().is_hidden().then(|| {
+        let label = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        spawn_plain_progress(pb.clone(), label)
+    });
+    Progress { pb, ticker }
 }
 
 /// Plain GET for small files and servers without range support. Writes to
@@ -556,7 +776,7 @@ async fn fetch_single_stream(
         ensure_space(dest, total)?;
     }
     let tmp = PathBuf::from(format!("{}.rdtmp", dest.display()));
-    let pb = make_progress_bar(total_size, opts.quiet);
+    let pb = make_progress_bar(total_size, opts.quiet, dest, 0);
     let result = retrying(|| {
         pb.set_position(0);
         single_stream_once(client, url, &tmp, total_size, &pb)
@@ -680,8 +900,15 @@ async fn fetch_segmented(
     let sidecar = Arc::new(tokio::sync::Mutex::new(sidecar));
     let bytes_done = Arc::new(AtomicU64::new(already_done_bytes));
 
-    let pb = make_progress_bar(Some(total_size), opts.quiet);
-    pb.set_position(already_done_bytes);
+    if resuming && !opts.quiet {
+        status(&format!(
+            "resuming: {} of {} already downloaded",
+            crate::output::human_bytes(already_done_bytes as i64),
+            crate::output::human_bytes(total_size as i64)
+        ));
+    }
+
+    let pb = make_progress_bar(Some(total_size), opts.quiet, dest, already_done_bytes);
 
     let mut tasks = tokio::task::JoinSet::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(opts.concurrency.max(1)));
@@ -737,7 +964,13 @@ async fn fetch_segmented(
     pb.finish_and_clear();
 
     if let Some(e) = first_error {
-        return Err(e);
+        // Make the way out obvious: the full-size file on disk looks finished
+        // (or corrupt) but isn't, and deleting it throws the progress away.
+        return Err(e.context(format!(
+            "partial download kept: {} is incomplete (progress in {}); rerun the same command to resume, and don't delete either file",
+            dest.display(),
+            Sidecar::path_for(dest).display()
+        )));
     }
 
     Sidecar::delete(dest);
@@ -928,6 +1161,35 @@ fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_failures() {
+        use crate::api::error::RdError;
+        let full = check_space(10, 1, Path::new(".")).unwrap_err();
+        assert!(!is_retryable(&full.context("failed to download x")));
+        let dead: anyhow::Error = RdError::Api {
+            code: 24,
+            message: "unavailable_file".into(),
+            status: 503,
+        }
+        .into();
+        assert!(!is_retryable(&dead), "a missing file stays missing");
+        let busy: anyhow::Error = RdError::Api {
+            code: 25,
+            message: "service_unavailable".into(),
+            status: 503,
+        }
+        .into();
+        assert!(is_retryable(&busy), "other 5xx are transient");
+        let gone: anyhow::Error = RdError::Api {
+            code: 19,
+            message: "hoster_unavailable".into(),
+            status: 400,
+        }
+        .into();
+        assert!(!is_retryable(&gone));
+        assert!(is_retryable(&anyhow::anyhow!("short read")));
+    }
 
     #[test]
     fn split_ranges_uses_fixed_chunks() {

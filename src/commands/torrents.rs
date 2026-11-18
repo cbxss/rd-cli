@@ -13,16 +13,22 @@ pub async fn add(
     magnet_or_file: String,
     host: Option<String>,
     select: Option<String>,
+    json: bool,
 ) -> Result<()> {
     let client = client()?;
 
     let id = torrent::add(&client, &magnet_or_file, host.as_deref()).await?;
-    println!("added torrent {id}");
-
-    if let Some(files) = select {
-        select_inner(&client, id, files).await?;
+    if !json {
+        println!("added torrent {id}");
     }
 
+    if let Some(files) = select {
+        select_inner(&client, id.clone(), files, json).await?;
+    }
+
+    if json {
+        output::print_json(&serde_json::json!({ "id": id }))?;
+    }
     Ok(())
 }
 
@@ -56,9 +62,12 @@ pub async fn list(filter: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn info(id: String) -> Result<()> {
+pub async fn info(id: String, json: bool) -> Result<()> {
     let client = client()?;
     let info: TorrentInfo = torrent::get_info(&client, &id).await?;
+    if json {
+        return output::print_json(&info);
+    }
 
     println!("ID:       {}", info.id);
     println!("Filename: {}", info.filename);
@@ -107,12 +116,12 @@ pub async fn info(id: String) -> Result<()> {
 
 pub async fn select(id: String, files: String) -> Result<()> {
     let client = client()?;
-    select_inner(&client, id, files).await
+    select_inner(&client, id, files, false).await
 }
 
 /// Selects files once Real-Debrid is ready for it. Never downloads: that's
 /// `rd dl <id>`, with its output directory and options.
-async fn select_inner(client: &Client, id: String, files: String) -> Result<()> {
+async fn select_inner(client: &Client, id: String, files: String, quiet: bool) -> Result<()> {
     let (info, selected) = torrent::select_when_ready(
         client,
         &id,
@@ -121,6 +130,9 @@ async fn select_inner(client: &Client, id: String, files: String) -> Result<()> 
         Some(torrent::DEFAULT_STALL_TIMEOUT),
     )
     .await?;
+    if quiet {
+        return Ok(());
+    }
     if selected {
         println!("Selected files {files}; torrent {id} is '{}'.", info.status);
     } else {

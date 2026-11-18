@@ -298,6 +298,52 @@ fn server_ignoring_ranges_falls_back_to_one_stream() {
 }
 
 #[test]
+fn redirected_output_gets_plain_progress_lines_and_a_finish_line() {
+    let env = Env::new();
+    let big = data(60 * MIB, 16);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("big.bin", big.clone())]));
+    env.fake.faults(|f| f.throttle_ms_per_mib = 10);
+
+    // Output is piped, so no bars are drawn: the ticker must report instead.
+    let out = support::run(
+        {
+            let mut c = env.cmd(&["dl", &magnet(HASH), "-o", "out"]);
+            c.env("RD_PROGRESS_MS", "50");
+            c
+        },
+        Duration::from_secs(120),
+    );
+    assert!(out.ok, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("progress: big.bin: ") && out.stdout.contains(" / 60.00 MiB ("),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("finished: "), "{}", out.stdout);
+    assert_file(&env.out_dir().join("big.bin"), &big);
+}
+
+#[test]
+fn quiet_prints_no_progress_lines() {
+    let env = Env::new();
+    let big = data(60 * MIB, 17);
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("big.bin", big.clone())]));
+    env.fake.faults(|f| f.throttle_ms_per_mib = 5);
+    let out = support::run(
+        {
+            let mut c = env.cmd(&["dl", &magnet(HASH), "-o", "out", "-q"]);
+            c.env("RD_PROGRESS_MS", "20");
+            c
+        },
+        Duration::from_secs(120),
+    );
+    assert!(out.ok, "{}", out.stderr);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+}
+
+#[test]
 fn interrupted_download_resumes_where_it_stopped() {
     let env = Env::new();
     let big = data(140 * MIB, 15);
@@ -332,8 +378,9 @@ fn interrupted_download_resumes_where_it_stopped() {
 
     env.fake.take_ranges();
     env.fake.faults(|f| f.throttle_ms_per_mib = 0);
-    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q"]);
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out"]);
     assert!(out.ok, "{}", out.stderr);
+    assert!(out.stdout.contains("resuming: "), "{}", out.stdout);
 
     let refetched = env.fake.take_ranges();
     assert!(
@@ -380,6 +427,12 @@ fn link_expiring_mid_download_stops_quickly() {
     let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-q", "--concurrency", "2"]);
     assert!(!out.ok);
     assert!(out.stderr.contains("403"), "{}", out.stderr);
+    assert_eq!(out.code, Some(3), "a rerunnable failure exits 3");
+    assert!(
+        out.stderr.contains("rerun the same command to resume"),
+        "{}",
+        out.stderr
+    );
     // 7 chunks, 2 connections; a 403 isn't retried and the remaining chunks
     // are abandoned. The file gets one more pass (with a freshly unrestricted
     // link, which is what fixes a genuinely expired one): at most 2 + 2.
@@ -823,4 +876,295 @@ fn many_files_bench() {
             started.elapsed().as_secs_f64()
         );
     }
+}
+
+type Blob = Arc<Vec<u8>>;
+
+fn three_files() -> (Blob, Blob, Blob) {
+    (data(1000, 30), data(2000, 31), data(3000, 32))
+}
+
+fn json(out: &Out) -> serde_json::Value {
+    serde_json::from_str(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}): {}", out.stdout))
+}
+
+#[test]
+fn dl_json_reports_the_files_written() {
+    let env = Env::new();
+    let (a, b, _) = three_files();
+    env.fake.on_magnet(TorrentSpec::new(
+        HASH,
+        vec![("a.bin", a.clone()), ("b.bin", b.clone())],
+    ));
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "--json"]);
+    assert!(out.ok, "{}", out.stderr);
+    let v = json(&out);
+    let files = v["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{v}");
+    for f in files {
+        let path = env.dir.path().join(f["path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            f["bytes"].as_u64().unwrap()
+        );
+    }
+    assert_eq!(v["failed"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn dl_list_prints_direct_links_and_downloads_nothing() {
+    let env = Env::new();
+    let (a, b, _) = three_files();
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("a.bin", a), ("b.bin", b)]));
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-l"]);
+    assert!(out.ok, "{}", out.stderr);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", out.stdout);
+    assert!(
+        lines.iter().all(|l| l.starts_with("http")),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(env.fake.take_file_gets(), 0, "-l must not download");
+    assert!(!env.out_dir().join("a.bin").exists());
+}
+
+#[test]
+fn dl_hoster_link_supports_list_json_and_output_file() {
+    let env = Env::new();
+    let a = data(700, 33);
+    let tid = env.fake.add_torrent(
+        TorrentSpec::new(HASH, vec![("a.bin", a.clone())])
+            .initial(step("downloaded", 100.0))
+            .script(vec![])
+            .selected(vec![true]),
+    );
+    let link = format!("{}/hoster/{tid}/1", env.fake.url());
+
+    let out = env.run(&["dl", &link, "-l"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
+
+    let out = env.run(&["dl", &link, "-o", "out", "-O", "renamed.bin", "--json"]);
+    assert!(out.ok, "{}", out.stderr);
+    let v = json(&out);
+    assert!(
+        v["files"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("renamed.bin"),
+        "{v}"
+    );
+    assert_file(&env.out_dir().join("renamed.bin"), &a);
+}
+
+#[test]
+fn dl_select_downloads_only_the_chosen_files() {
+    let env = Env::new();
+    let (a, b, c) = three_files();
+    env.fake.on_magnet(TorrentSpec::new(
+        HASH,
+        vec![
+            ("a.bin", a.clone()),
+            ("b.bin", b.clone()),
+            ("c.bin", c.clone()),
+        ],
+    ));
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "--select", "2"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_file(&env.out_dir().join("b.bin"), &b);
+    assert!(!env.out_dir().join("a.bin").exists());
+    assert!(!env.out_dir().join("c.bin").exists());
+
+    // The existing torrent only has file 2: a different selection must not
+    // reuse it (that would silently download the wrong files).
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "--select", "1,3"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(env.fake.add_count(), 2);
+    assert_file(&env.out_dir().join("a.bin"), &a);
+    assert_file(&env.out_dir().join("c.bin"), &c);
+
+    // The same selection again reuses the matching torrent.
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "--select", "3, 1"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(env.fake.add_count(), 2);
+}
+
+#[test]
+fn dl_select_on_a_torrent_with_another_selection_fails_clearly() {
+    let env = Env::new();
+    let (a, b, _) = three_files();
+    let tid = env.fake.add_torrent(
+        TorrentSpec::new(HASH, vec![("a.bin", a.clone()), ("b.bin", b)])
+            .initial(step("downloaded", 100.0))
+            .script(vec![])
+            .selected(vec![true, false]),
+    );
+
+    let out = env.run(&["dl", &tid, "-o", "out", "--select", "2"]);
+    assert!(!out.ok);
+    assert_eq!(out.code, Some(1));
+    assert!(
+        out.stderr.contains("can't change a") && out.stderr.contains("selection"),
+        "{}",
+        out.stderr
+    );
+    assert!(!env.out_dir().join("a.bin").exists());
+
+    // Matching the existing selection, or not passing --select, is fine.
+    let out = env.run(&["dl", &tid, "-o", "out", "--select", "1"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_file(&env.out_dir().join("a.bin"), &a);
+}
+
+#[test]
+fn dl_output_file_needs_a_single_file() {
+    let env = Env::new();
+    let (a, b, _) = three_files();
+    env.fake.on_magnet(TorrentSpec::new(
+        HASH,
+        vec![("a.bin", a.clone()), ("b.bin", b)],
+    ));
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "-O", "x.bin"]);
+    assert!(!out.ok);
+    assert!(out.stderr.contains("needs a single file"), "{}", out.stderr);
+    assert_eq!(env.fake.take_file_gets(), 0);
+
+    let out = env.run(&[
+        "dl",
+        &magnet(HASH),
+        "-o",
+        "out",
+        "-O",
+        "x.bin",
+        "--select",
+        "1",
+    ]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_file(&env.out_dir().join("x.bin"), &a);
+}
+
+#[test]
+fn bad_select_and_conflicting_flags_are_usage_errors() {
+    let env = Env::new();
+    let out = env.run(&["dl", &magnet(HASH), "--select", "1,x"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    let out = env.run(&["dl", &magnet(HASH), "-l", "--json"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+}
+
+#[test]
+fn torrents_info_json() {
+    let env = Env::new();
+    let (a, b, _) = three_files();
+    let tid = env.fake.add_torrent(
+        TorrentSpec::new(HASH, vec![("a.bin", a), ("b.bin", b)])
+            .initial(step("downloaded", 100.0))
+            .script(vec![])
+            .selected(vec![true, true]),
+    );
+    let out = env.run(&["torrents", "info", &tid, "--json"]);
+    assert!(out.ok, "{}", out.stderr);
+    let v = json(&out);
+    assert_eq!(v["id"], tid.as_str());
+    assert_eq!(v["files"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn dl_json_on_a_failed_download_still_prints_the_report() {
+    let env = Env::new();
+    env.fake.on_magnet(TorrentSpec::new(
+        HASH,
+        vec![("big.bin", data(100 * MIB, 40))],
+    ));
+    env.fake.faults(|f| f.fail_ranges_with = Some(403));
+
+    let out = env.run(&["dl", &magnet(HASH), "-o", "out", "--json"]);
+    assert_eq!(out.code, Some(3), "{}", out.stderr);
+    let v = json(&out);
+    assert_eq!(v["files"].as_array().unwrap().len(), 0, "{v}");
+    let failed = v["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{v}");
+    assert_eq!(failed[0]["retryable"], true);
+}
+
+#[test]
+fn a_dead_hoster_link_exits_1_not_3() {
+    let env = Env::new();
+    // The fake rejects links it doesn't host with 400 wrong_parameter. (A
+    // missing file is a 503 that the client retries for a while first; the
+    // unit tests cover classifying that one.)
+    let dead = format!("{}/not-a-hoster/1", env.fake.url());
+    for args in [
+        vec!["dl", dead.as_str(), "-o", "out"],
+        vec!["unrestrict", dead.as_str(), "-o", "out"],
+    ] {
+        let out = env.run(&args);
+        assert_eq!(out.code, Some(1), "{args:?}: {}", out.stderr);
+    }
+    let out = env.run(&["dl", &dead, "-o", "out", "--json"]);
+    assert_eq!(out.code, Some(1), "{}", out.stderr);
+    assert_eq!(json(&out)["failed"][0]["retryable"], false);
+}
+
+#[test]
+fn dl_download_id_supports_list_json_and_output_file() {
+    let env = Env::new();
+    let b = data(900, 41);
+    let did = env.fake.add_download("b.bin", b.clone());
+
+    let out = env.run(&["dl", &did, "-l"]);
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
+    assert!(out.stdout.starts_with("http"), "{}", out.stdout);
+    assert!(!env.out_dir().exists());
+
+    let out = env.run(&["dl", &did, "-o", "out", "-O", "named.bin", "--json"]);
+    assert!(out.ok, "{}", out.stderr);
+    let v = json(&out);
+    assert!(
+        v["files"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("named.bin"),
+        "{v}"
+    );
+    assert_file(&env.out_dir().join("named.bin"), &b);
+
+    let out = env.run(&["dl", &did, "--select", "1"]);
+    assert_eq!(out.code, Some(1));
+    assert!(
+        out.stderr.contains("only applies to torrents"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn torrents_add_json_prints_only_the_id() {
+    let env = Env::new();
+    let (a, b, _) = three_files();
+    env.fake
+        .on_magnet(TorrentSpec::new(HASH, vec![("a.bin", a), ("b.bin", b)]));
+
+    let out = env.run(&["torrents", "add", &magnet(HASH), "--select", "2", "--json"]);
+    assert!(out.ok, "{}", out.stderr);
+    let v = json(&out);
+    let id = v["id"].as_str().unwrap();
+
+    let out = env.run(&["torrents", "info", id, "--json"]);
+    let info = json(&out);
+    let selected: Vec<i64> = info["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["selected"].as_i64().unwrap())
+        .collect();
+    assert_eq!(selected, vec![0, 1]);
 }

@@ -6,13 +6,80 @@ use anyhow::{Context, Result};
 use crate::api::Client;
 use crate::api::models::UnrestrictedLink;
 use crate::cli::UnrestrictArgs;
-use crate::download::{self, DownloadOpts};
+use crate::download::{self, DownloadOpts, Report};
 use crate::output;
 
 pub async fn run(args: UnrestrictArgs) -> Result<()> {
     // Fails fast, before touching the network, if there is no token.
     let client = Client::from_config()?;
+    let resolved = resolve(&client, &args).await?;
+    let links: Vec<&UnrestrictedLink> = resolved.successes.iter().map(|(_, ul)| ul).collect();
 
+    // -l: write the resulting download URLs to stdout and stop. This overrides
+    // -t and -q, per the original tool's documented behavior — no download
+    // happens, and no other status output is printed either way.
+    if args.list {
+        for ul in &links {
+            println!("{}", ul.download);
+        }
+        return resolved.finish_without_download();
+    }
+
+    if args.json {
+        // Bulk (file) mode always prints an array, even if it only contained a
+        // single link; a single link passed directly on the command line
+        // prints a bare object.
+        if !resolved.bulk {
+            if let Some(ul) = links.first() {
+                output::print_json(ul)?;
+            }
+        } else {
+            output::print_json(&links)?;
+        }
+    }
+
+    if args.test {
+        // -t: do everything except the actual download.
+        if !args.json && !args.quiet {
+            for ul in &links {
+                println!("{} ({})", ul.filename, output::human_bytes(ul.filesize));
+            }
+        }
+        return resolved.finish_without_download();
+    }
+
+    // With --json, stdout carries only the JSON document.
+    let quiet = args.quiet || args.json;
+    download_resolved(resolved, &args, quiet)
+        .await?
+        .finish(false)
+}
+
+/// The unrestrict step of a run: each link resolved, or its failure (already
+/// reported on stderr).
+pub struct Resolved {
+    /// The argument was a file of links.
+    bulk: bool,
+    successes: Vec<(String, UnrestrictedLink)>,
+    failures: Vec<(String, anyhow::Error)>,
+}
+
+impl Resolved {
+    pub fn direct_urls(&self) -> impl Iterator<Item = &str> {
+        self.successes.iter().map(|(_, ul)| ul.download.as_str())
+    }
+
+    pub fn finish_without_download(&self) -> Result<()> {
+        if !self.failures.is_empty() {
+            let total = self.failures.len() + self.successes.len();
+            anyhow::bail!("{} of {total} link(s) failed", self.failures.len());
+        }
+        Ok(())
+    }
+}
+
+/// Reads the link argument (a link, or a file of them) and unrestricts each.
+pub async fn resolve(client: &Client, args: &UnrestrictArgs) -> Result<Resolved> {
     let bulk = Path::new(&args.link).is_file();
     let links = collect_links(&args.link)?;
     if links.is_empty() {
@@ -22,66 +89,48 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
         anyhow::bail!("-O/--output-file only works with a single link, not a file of links");
     }
 
-    let mut successes: Vec<UnrestrictedLink> = Vec::new();
-    let mut failures = 0usize;
-
-    for link in &links {
-        match unrestrict_one(&client, link, args.password.as_deref()).await {
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for link in links {
+        match unrestrict_one(client, &link, args.password.as_deref()).await {
             Ok(ul) => {
                 if !args.quiet && !args.list && !args.json {
                     download::status(&format!("unrestricted: {link} -> {}", ul.filename));
                 }
-                successes.push(ul);
+                successes.push((link, ul));
             }
             Err(err) => {
                 eprintln!("error: failed to unrestrict {link}: {err:#}");
-                failures += 1;
+                failures.push((link, err));
             }
         }
     }
+    Ok(Resolved {
+        bulk,
+        successes,
+        failures,
+    })
+}
 
-    // -l: write the resulting download URLs to stdout and stop. This overrides
-    // -t and -q, per the original tool's documented behavior — no download
-    // happens, and no other status output is printed either way.
-    if args.list {
-        for ul in &successes {
-            println!("{}", ul.download);
-        }
-        return finish(failures, links.len());
+/// Downloads every resolved link into `-o`, reporting each failure on
+/// stderr. Unrestrict failures are included in the report.
+pub async fn download_resolved(
+    resolved: Resolved,
+    args: &UnrestrictArgs,
+    quiet: bool,
+) -> Result<Report> {
+    let mut report = Report::default();
+    for (link, err) in &resolved.failures {
+        report.add_failure(link, err);
     }
-
-    if args.json {
-        // Bulk (file) mode always prints an array, even if it only contained a
-        // single link; a single link passed directly on the command line
-        // prints a bare object.
-        if !bulk {
-            if let Some(ul) = successes.first() {
-                output::print_json(ul)?;
-            }
-        } else {
-            output::print_json(&successes)?;
-        }
-    }
-
-    if args.test {
-        // -t: do everything except the actual download.
-        if !args.json && !args.quiet {
-            for ul in &successes {
-                println!("{} ({})", ul.filename, output::human_bytes(ul.filesize));
-            }
-        }
-        return finish(failures, links.len());
-    }
-
     let out_dir = download::prepare_out_dir(args.output_dir.as_deref())?;
-    // With --json, stdout carries only the JSON document.
     let opts = DownloadOpts {
         concurrency: args.concurrency,
-        quiet: args.quiet || args.json,
+        quiet,
     };
     // Several links can resolve to the same file name; give each its own.
     let mut claimed = std::collections::HashSet::new();
-    for ul in &successes {
+    for (link, ul) in &resolved.successes {
         // -O is the user's own choice and may include a path; the name
         // Real-Debrid returns is reduced to a bare, portable file name.
         let filename = match &args.output_file {
@@ -89,22 +138,15 @@ pub async fn run(args: UnrestrictArgs) -> Result<()> {
             None => download::unique_name(&mut claimed, &download::safe_filename(&ul.filename)),
         };
         let dest = out_dir.join(filename);
-        if let Err(err) =
-            download::fetch_file(&ul.download, &ul.filename, ul.chunks, &dest, opts).await
-        {
-            eprintln!("error: {err:#}");
-            failures += 1;
+        match download::fetch_file(&ul.download, &ul.filename, ul.chunks, &dest, opts).await {
+            Ok(path) => report.add_file(&path),
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                report.add_failure(link, &err);
+            }
         }
     }
-
-    finish(failures, links.len())
-}
-
-fn finish(failures: usize, total: usize) -> Result<()> {
-    if failures > 0 {
-        anyhow::bail!("{failures} of {total} link(s) failed");
-    }
-    Ok(())
+    Ok(report)
 }
 
 async fn unrestrict_one(

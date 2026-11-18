@@ -24,7 +24,16 @@ async fn main() {
     }
     if let Err(err) = run().await {
         eprintln!("error: {err:#}");
-        std::process::exit(1);
+        // 3: rerunning the same command can finish the job; 1: anything else.
+        // (clap exits 2 for usage errors.)
+        let rerun = err
+            .chain()
+            .any(|e| e.downcast_ref::<download::Incomplete>().is_some());
+        std::process::exit(if rerun {
+            download::Incomplete::EXIT_CODE
+        } else {
+            1
+        });
     }
 }
 
@@ -50,9 +59,10 @@ async fn run() -> Result<()> {
                 magnet_or_file,
                 host,
                 select,
-            } => commands::torrents::add(magnet_or_file, host, select).await,
+                json,
+            } => commands::torrents::add(magnet_or_file, host, select, json).await,
             TorrentsCommand::List { filter, json } => commands::torrents::list(filter, json).await,
-            TorrentsCommand::Info { id } => commands::torrents::info(id).await,
+            TorrentsCommand::Info { id, json } => commands::torrents::info(id, json).await,
             TorrentsCommand::Select { id, files } => commands::torrents::select(id, files).await,
             TorrentsCommand::Delete { id } => commands::torrents::delete(id).await,
         },

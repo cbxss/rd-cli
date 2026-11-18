@@ -9,10 +9,14 @@ use anyhow::Result;
 use crate::api::Client;
 use crate::api::models::{DownloadEntry, TorrentInfo};
 use crate::cli::{DlArgs, UnrestrictArgs};
-use crate::download::{self, DownloadOpts};
+use crate::commands::unrestrict;
+use crate::download::{self, DownloadOpts, Report};
 use crate::torrent::{self, LinkOpts};
 
-pub async fn run(args: DlArgs) -> Result<()> {
+pub async fn run(mut args: DlArgs) -> Result<()> {
+    // Machine-readable modes keep stdout for their own output.
+    args.quiet |= args.json || args.list;
+
     if args.link.starts_with("magnet:") || is_torrent_file(&args.link) {
         return run_torrent(args).await;
     }
@@ -23,20 +27,33 @@ pub async fn run(args: DlArgs) -> Result<()> {
     if looks_like_id(&args.link) && !exists {
         return run_existing(args).await;
     }
+    if args.select.is_some() {
+        anyhow::bail!("--select only applies to magnets, .torrent files and torrent ids");
+    }
 
     // Hoster link, or a file listing several — same code path as `rd unrestrict`.
-    crate::commands::unrestrict::run(UnrestrictArgs {
+    let unrestrict_args = UnrestrictArgs {
         link: args.link,
         output_dir: args.output_dir,
-        output_file: None,
+        output_file: args.output_file,
         password: args.password,
         test: false,
         quiet: args.quiet,
-        list: false,
+        list: args.list,
         json: false,
         concurrency: args.concurrency,
-    })
-    .await
+    };
+    let client = Client::from_config()?;
+    let resolved = unrestrict::resolve(&client, &unrestrict_args).await?;
+    if args.list {
+        for url in resolved.direct_urls() {
+            println!("{url}");
+        }
+        return resolved.finish_without_download();
+    }
+    unrestrict::download_resolved(resolved, &unrestrict_args, args.quiet)
+        .await?
+        .finish(args.json)
 }
 
 fn is_torrent_file(link: &str) -> bool {
@@ -65,39 +82,55 @@ fn link_opts(args: &DlArgs) -> LinkOpts {
 
 async fn run_torrent(args: DlArgs) -> Result<()> {
     let client = Client::from_config()?;
+    let files = args.select.as_deref().unwrap_or("all");
+    let id =
+        torrent::add_or_reuse(&client, &args.link, args.host.as_deref(), files, args.quiet).await?;
+    torrent_output(&client, &id, files, &args).await
+}
+
+/// Lists or downloads torrent `id`'s files.
+async fn torrent_output(client: &Client, id: &str, files: &str, args: &DlArgs) -> Result<()> {
+    let stall = stall_timeout(args.stall_timeout);
+    if args.list {
+        for url in torrent::direct_links(client, id, files, args.quiet, stall).await? {
+            println!("{url}");
+        }
+        return Ok(());
+    }
     let out_dir = download::prepare_out_dir(args.output_dir.as_deref())?;
-    let id = torrent::add_or_reuse(&client, &args.link, args.host.as_deref(), args.quiet).await?;
     torrent::download(
-        &client,
-        &id,
-        "all",
+        client,
+        id,
+        files,
         &out_dir,
-        link_opts(&args),
-        stall_timeout(args.stall_timeout),
+        link_opts(args),
+        stall,
+        args.output_file.as_deref(),
     )
-    .await
+    .await?
+    .finish(args.json)
 }
 
 /// `rd dl <id>`: an existing torrent ID (from `rd torrents list`), or a
 /// download-history ID (from `rd downloads list`).
 async fn run_existing(args: DlArgs) -> Result<()> {
     let client = Client::from_config()?;
-    let out_dir = download::prepare_out_dir(args.output_dir.as_deref())?;
 
     match client
         .get_json::<TorrentInfo>(&format!("/torrents/info/{}", args.link))
         .await
     {
         Ok(_) => {
-            torrent::download(
-                &client,
-                &args.link,
-                "all",
-                &out_dir,
-                link_opts(&args),
-                stall_timeout(args.stall_timeout),
-            )
-            .await
+            // Without --select, download whatever is selected (all files if
+            // nothing is yet): `rd torrents select` may have picked them.
+            let files = match args.select.as_deref() {
+                Some(files) => {
+                    torrent::ensure_selection(&client, &args.link, files).await?;
+                    files
+                }
+                None => "all",
+            };
+            torrent_output(&client, &args.link, files, &args).await
         }
         Err(err) if torrent::is_not_found(&err) => {
             let downloads: Vec<DownloadEntry> = client.get_all_pages("/downloads", &[]).await?;
@@ -107,14 +140,37 @@ async fn run_existing(args: DlArgs) -> Result<()> {
                     args.link
                 );
             };
-            let dest = out_dir.join(download::safe_filename(&entry.filename));
+            if args.select.is_some() {
+                anyhow::bail!(
+                    "--select only applies to torrents; {} is a download",
+                    args.link
+                );
+            }
+            if args.list {
+                println!("{}", entry.download);
+                return Ok(());
+            }
+            let out_dir = download::prepare_out_dir(args.output_dir.as_deref())?;
+            let name = match &args.output_file {
+                Some(name) => name.clone(),
+                None => download::safe_filename(&entry.filename),
+            };
+            let dest = out_dir.join(name);
             let opts = DownloadOpts {
                 concurrency: args.concurrency,
                 quiet: args.quiet,
             };
-            download::fetch_file(&entry.download, &entry.filename, entry.chunks, &dest, opts)
+            let mut report = Report::default();
+            match download::fetch_file(&entry.download, &entry.filename, entry.chunks, &dest, opts)
                 .await
-                .map(|_| ())
+            {
+                Ok(path) => report.add_file(&path),
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    report.add_failure(&entry.link, &err);
+                }
+            }
+            report.finish(args.json)
         }
         Err(err) => Err(err.into()),
     }
